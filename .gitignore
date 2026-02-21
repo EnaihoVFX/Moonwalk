@@ -1,0 +1,6 @@
+node_modules/
+venv/
+.DS_Store
+__pycache__/
+*.log
+hey_moonwalk.ppn

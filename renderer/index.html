@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Moonwalk</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+
+<body>
+  <main class="stage">
+    <section id="ui-wrapper" class="glass-pill state-idle" role="status" aria-live="polite">
+
+      <!-- Speech (Idle / Listening) -->
+      <div class="content-wrapper" id="ui-speech">
+        <svg class="mic-icon" viewBox="0 0 24 24">
+          <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
+          <path
+            d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
+        </svg>
+        <span class="status-text" id="status-text">Hey Moonwalk</span>
+      </div>
+
+      <!-- Loading (Thinking) -->
+      <div class="content-wrapper hidden" id="ui-loading">
+        <div class="bouncing-balls">
+          <div class="ball"></div>
+          <div class="ball"></div>
+          <div class="ball"></div>
+        </div>
+      </div>
+
+      <!-- Doing (Action in progress) -->
+      <div class="content-wrapper hidden" id="ui-doing">
+        <div class="spinner"></div>
+        <img src="" alt="App Icon" class="app-icon" id="app-icon" />
+        <span class="status-text" id="doing-text">Processing...</span>
+        <span id="tier-badge" class="tier-badge hidden"></span>
+      </div>
+
+    </section>
+
+    <input id="key-capture" class="key-capture" type="text" aria-label="Press Enter to send" autocomplete="off" />
+  </main>
+
+  <script src="./renderer.js"></script>
+</body>
+
+</html>

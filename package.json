@@ -1,0 +1,13 @@
+{
+  "name": "liquid-assistant",
+  "version": "0.1.0",
+  "description": "Electron liquid assistant overlay",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "electron": "^36.2.0",
+    "ws": "^8.19.0"
+  }
+}

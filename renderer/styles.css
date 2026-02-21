@@ -1,0 +1,253 @@
+/* ─────────────────────────────────────────────────────────────
+   MOONWALK – Dynamic Island Design System (Light Neumorphic)
+   ───────────────────────────────────────────────────────────── */
+
+:root {
+  --text: #333;
+  --text-active: #007aff;
+  --muted: #555;
+  --accent: #007aff;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.stage {
+  width: 100vw;
+  height: 100vh;
+  display: grid;
+  place-items: start center;
+  padding-top: 16px;
+  pointer-events: none;
+}
+
+/* ── The Dynamic Pill ── */
+.glass-pill {
+  height: 60px;
+  border-radius: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 0 24px;
+  cursor: default;
+  overflow: hidden;
+  pointer-events: auto;
+
+  /* Light Neumorphic Glass */
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+
+  /* Neumorphic shadows */
+  box-shadow:
+    10px 10px 20px rgba(0, 0, 0, 0.05),
+    -10px -10px 20px rgba(255, 255, 255, 1),
+    inset 3px 3px 6px rgba(255, 255, 255, 0.8),
+    inset -3px -3px 6px rgba(0, 0, 0, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.4);
+
+  /* The signature bouncy transition */
+  transition: all 0.6s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+  will-change: width, height, box-shadow;
+}
+
+/* ── State Sizing & Glows ── */
+.state-idle {
+  width: 200px;
+}
+
+.state-listening {
+  width: 380px;
+  height: 70px;
+  box-shadow:
+    10px 10px 20px rgba(0, 0, 0, 0.05),
+    -10px -10px 20px rgba(255, 255, 255, 1),
+    inset 3px 3px 6px rgba(255, 255, 255, 0.8),
+    inset -3px -3px 15px rgba(0, 122, 255, 0.15);
+}
+
+.state-loading {
+  width: 120px;
+}
+
+.state-doing {
+  width: 300px;
+}
+
+/* ── Typography ── */
+.status-text {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 16px;
+  white-space: nowrap;
+  text-transform: capitalize;
+  transition: color 0.3s ease;
+}
+
+.state-listening .status-text {
+  color: var(--text-active);
+}
+
+.state-doing .status-text {
+  color: var(--text);
+}
+
+/* ── Content Wrappers ── */
+.content-wrapper {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  width: 100%;
+  animation: fade-in 0.4s ease forwards;
+}
+
+.hidden {
+  display: none !important;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* ── Bouncing Balls (Loading / Thinking) ── */
+.bouncing-balls {
+  display: flex;
+  gap: 6px;
+}
+
+.ball {
+  width: 10px;
+  height: 10px;
+  background-color: var(--text-active);
+  border-radius: 50%;
+  animation: bounce 0.5s infinite alternate;
+}
+
+.ball:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.ball:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes bounce {
+  from {
+    transform: translateY(4px);
+    opacity: 0.5;
+  }
+
+  to {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
+}
+
+/* ── Rotating Spinner (Doing) ── */
+.spinner {
+  width: 18px;
+  height: 18px;
+  border: 3px solid rgba(0, 122, 255, 0.2);
+  border-top: 3px solid #007aff;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes spin {
+  0% {
+    transform: rotate(0deg);
+  }
+
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+/* ── Dynamic App Icon ── */
+.app-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  object-fit: cover;
+  display: none;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+}
+
+/* ── SVG Mic Icon ── */
+.mic-icon {
+  width: 20px;
+  height: 20px;
+  fill: var(--muted);
+  transition: all 0.3s ease;
+}
+
+.state-listening .mic-icon {
+  fill: var(--text-active);
+  animation: pulse-mic 1.5s infinite;
+}
+
+@keyframes pulse-mic {
+  0% {
+    transform: scale(1);
+    opacity: 1;
+  }
+
+  50% {
+    transform: scale(1.15);
+    opacity: 0.7;
+  }
+
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* ── Tier Badge ── */
+.tier-badge {
+  position: absolute;
+  top: 12px;
+  right: 18px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.key-capture {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  left: -9999px;
+  opacity: 0;
+  pointer-events: none;
+}
