@@ -4,3 +4,4 @@ venv/
 __pycache__/
 *.log
 hey_moonwalk.ppn
+.env

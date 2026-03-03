@@ -16,17 +16,16 @@ const HOTKEYS = (process.env.LIQUID_HOTKEY || "CommandOrControl+Shift+Space,Alt+
   .map((value) => value.trim())
   .filter(Boolean);
 
-const WINDOW_WIDTH = 800;
-const WINDOW_HEIGHT = 400;
 const WINDOW_LEVEL = "screen-saver";
 
 let mainWindow;
+let dashboardWindow = null;
 let lastWakeAt = 0;
 let pythonProcess = null;
 
 function startPythonBackend() {
   const venvPythonPath = path.join(__dirname, "venv", "bin", "python3");
-  const scriptPath = path.join(__dirname, "backend_server.py");
+  const scriptPath = path.join(__dirname, "backend", "backend_server.py");
 
   if (!fs.existsSync(venvPythonPath)) {
     console.error(`[Backend] Python executable not found at: ${venvPythonPath}`);
@@ -80,14 +79,19 @@ function emitStartListening() {
 }
 
 function createWindow() {
+  const display = screen.getPrimaryDisplay();
+  const { width, height } = display.workAreaSize;
+
   mainWindow = new BrowserWindow({
-    width: WINDOW_WIDTH,
-    height: WINDOW_HEIGHT,
+    width: width,
+    height: height,
+    x: display.workArea.x,
+    y: display.workArea.y,
     show: true,
     frame: false,
     transparent: true,
     resizable: false,
-    movable: true,
+    movable: false,
     hasShadow: false,
     alwaysOnTop: true,
     skipTaskbar: true,
@@ -104,7 +108,6 @@ function createWindow() {
   mainWindow.setFullScreenable(false);
   setMousePassthrough(true);
 
-  centerNearTop();
   mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
 }
 
@@ -119,7 +122,6 @@ function centerNearTop() {
 function wakeOverlay() {
   if (!mainWindow) return;
   lastWakeAt = Date.now();
-  centerNearTop();
   mainWindow.show();
   emitStartListening();
 }
@@ -128,6 +130,47 @@ function hideOverlay() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   setMousePassthrough(true);
   mainWindow.webContents.send("overlay-hidden");
+}
+
+function createDashboardWindow(agentId = null) {
+  if (dashboardWindow && !dashboardWindow.isDestroyed()) {
+    dashboardWindow.focus();
+    return;
+  }
+
+  dashboardWindow = new BrowserWindow({
+    width: 900,
+    height: 600,
+    minWidth: 640,
+    minHeight: 400,
+    show: false,
+    frame: true,
+    titleBarStyle: "hiddenInset",
+    transparent: false,
+    resizable: true,
+    backgroundColor: "#f5f5f7",
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+
+  if (agentId) {
+    dashboardWindow.loadFile(path.join(__dirname, "renderer", "dashboard.html"), {
+      search: `agent=${encodeURIComponent(agentId)}`
+    });
+  } else {
+    dashboardWindow.loadFile(path.join(__dirname, "renderer", "dashboard.html"));
+  }
+
+  dashboardWindow.once("ready-to-show", () => {
+    dashboardWindow.show();
+  });
+
+  dashboardWindow.on("closed", () => {
+    dashboardWindow = null;
+  });
 }
 
 function registerHotkey() {
@@ -143,6 +186,16 @@ function registerHotkey() {
     } else {
       console.error(`Failed to register global shortcut: ${accelerator}`);
     }
+  }
+
+  // Register dashboard shortcut
+  const dOk = globalShortcut.register("CommandOrControl+Shift+D", () => {
+    createDashboardWindow();
+  });
+  if (dOk) {
+    registeredCount += 1;
+  } else {
+    console.error("Failed to register dashboard shortcut: CommandOrControl+Shift+D");
   }
 
   if (registeredCount === 0) {
@@ -222,6 +275,10 @@ ipcMain.on("log-error", (event, msg) => {
 
 ipcMain.on("log-info", (event, msg) => {
   console.log(`[Renderer Info] ${msg}`);
+});
+
+ipcMain.on("open-dashboard", (event, agentId) => {
+  createDashboardWindow(agentId);
 });
 
 app.on("will-quit", () => {

@@ -13,5 +13,6 @@ contextBridge.exposeInMainWorld("overlayAPI", {
     return () => ipcRenderer.removeListener("overlay-hidden", handler);
   },
   logError: (msg) => ipcRenderer.send("log-error", msg),
-  logInfo: (msg) => ipcRenderer.send("log-info", msg)
+  logInfo: (msg) => ipcRenderer.send("log-info", msg),
+  openDashboard: (agentId = null) => ipcRenderer.send("open-dashboard", agentId)
 });
