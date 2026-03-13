@@ -1,0 +1,2367 @@
+"""
+Moonwalk — Agent Core V2
+=========================
+Sense-Plan-Act-Verify (SPAV) architecture for improved tool calling.
+
+Key improvements over V1:
+  1. Structured WorldState instead of raw context strings
+  2. Explicit milestone planning before execution
+  3. Milestone micro-loop execution with verification
+  4. Intelligent tool selection (reduced from 30+ to a focused request surface)
+  5. Better error recovery with evidence-gated completion
+"""
+
+import asyncio
+import json
+import time as _time
+import os
+import uuid
+from typing import Callable, Optional, Awaitable, List
+from functools import partial
+from dataclasses import dataclass, field
+from urllib.parse import urlparse
+
+print = partial(print, flush=True)
+
+# Load .env file
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+
+# Moonwalk V2 modules
+from agent.world_state import WorldState, UserIntent, IntentParser, EntityExtractor, IntentAction
+from agent.planner import ExecutionStep, StepStatus
+from agent.planner import MilestonePlan, Milestone, MilestoneStatus
+from agent.task_planner import TaskPlanner
+from agent.verifier import get_verifier
+from agent.memory import ConversationMemory, UserPreferences, TaskStore, UserProfile, WorkingMemory
+from tools.selector import get_tool_selector, set_tool_gateway_context
+from tools import registry as tool_registry
+from providers.router import ModelRouter
+from providers import LLMProvider
+import agent.perception as perception
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Configuration
+# ═══════════════════════════════════════════════════════════════
+
+PENDING_PLAN_TTL_SECONDS = 600
+
+# Browser timing — seconds to wait after navigation actions so the page
+# has time to load and the snapshot can be refreshed.  Centralised here
+# instead of scattered as magic numbers throughout _execute_step().
+BROWSER_NAV_SETTLE_S = 1.5      # after web_search / click / open_url
+BROWSER_RECOVERY_SETTLE_S = 0.5 # after refresh_refs recovery
+
+BROWSER_APP_NAMES = {
+    "google chrome",
+    "chrome",
+    "safari",
+    "arc",
+    "brave browser",
+    "firefox",
+    "microsoft edge",
+    "edge",
+}
+
+WEB_FLOW_TOOLS = {
+    "open_url",
+    "get_web_information",
+    "web_search",
+    "fetch_web_content",
+    "web_scrape",
+    "browser_snapshot",
+    "browser_read_page",
+    "browser_read_text",
+    "read_page_content",
+    "extract_structured_data",
+    "get_page_summary",
+    "browser_find",
+    "browser_click_match",
+    "browser_click_ref",
+    "browser_type_ref",
+    "browser_select_ref",
+    "browser_refresh_refs",
+    "browser_scroll",
+    "browser_wait_for",
+    "browser_list_tabs",
+    "browser_switch_tab",
+    "gdocs_create",
+    "gdocs_append",
+    "gdocs_read",
+    "gworkspace_analyze",
+}
+
+# Simplified system prompt for V2 (planning is done separately)
+SYSTEM_PROMPT_V2 = """You are Moonwalk, a fast and helpful macOS desktop AI assistant.
+
+## Understanding the User
+
+You receive VOICE-TRANSCRIBED text — expect misspellings, homophones, and dropped words.
+Always infer the most plausible intent given the desktop context.
+
+### Pronoun & Reference Resolution
+- "it", "this", "that" → resolve against: (1) conversation history, (2) the active app/window/page, (3) the most recently mentioned entity.
+- "do it", "go ahead", "yes" → execute whatever was just proposed in conversation history.
+- When the context resolves the ambiguity, **act — don't ask for clarification.**
+
+### Context Interpretation
+Every request arrives with a `[Desktop Context]` block. USE IT:
+- **Active App** tells you what the user is working in. Route tool calls accordingly.
+- **Window Title** reveals the specific document, tab, or page.
+- **Browser URL** tells you the exact site for web page interactions.
+- **Page Content / Selected Text** shows what the user is looking at.
+- **Clipboard** shows what was recently copied.
+
+## Response Calibration
+
+Match response length to the request type:
+- **Actions** (open, close, click): 1 short sentence.
+- **Quick answers**: 1-2 sentences.
+- **Knowledge / explanations / math / code**: As detailed as needed. Don't truncate.
+- **Math**: Use LaTeX — `$x^2$` inline, `$$\\frac{a}{b}$$` for display blocks. The UI renders KaTeX.
+
+## Capabilities
+- You know the current date and time from the Desktop Context — NEVER call `run_shell("date")`. Use context for "next week", "tomorrow", etc.
+- Control apps, browse web, run terminal commands, read/write files
+- Automate UI (click, type, shortcuts), manage windows, clipboard
+
+## Tab Awareness (CRITICAL — prevent duplicate tabs)
+Before opening ANY URL with `open_url`, ALWAYS check if it's already open:
+1. `open_url` automatically checks known tabs. But if you're about to open a site you already visited this session, use `browser_switch_tab` instead.
+2. `browser_list_tabs` returns all known open tabs — use it when uncertain.
+3. Your Working Memory (below) shows URLs you already opened. NEVER re-open them.
+4. When the user says "go to X" and X is already open, SWITCH — don't open a new tab.
+5. For Google Workspace: use API tools (`gdocs_create`, etc.) instead of opening docs.new/sheets.new URLs.
+
+## Working Memory
+You have access to a working memory that tracks what you've done this session. Check it before repeating actions.
+The [Recent Actions] and [Session Entities] blocks in your context show your history — use them to:
+- Avoid re-opening URLs already opened
+- Avoid re-running searches already completed
+- Reference documents you already created (use their URLs)
+- Continue multi-step tasks without losing context
+
+## Browser Scrolling (CRITICAL)
+- **NEVER** use `press_key` to scroll web pages. `press_key(down/up/Page_Down)` scrolls the OS-level focus target (which is often the Electron app, not the browser page content). It will NOT move the web page.
+- **ALWAYS** use `browser_scroll(direction, amount)` to scroll browser pages. It scrolls the actual DOM, captures a fresh snapshot, and returns the new scroll position.
+- `browser_scroll` returns `scroll_y`, `page_height`, and `at_bottom`. Check `at_bottom` to know when you've reached the end of the page.
+- `browser_read_page` also returns `scroll_y`, `page_height`, `at_bottom` — use these to decide if scrolling is needed.
+- If `at_bottom` is true, **stop scrolling** — there's no more content below.
+- If `browser_read_page` shows the same content after scrolling, the page may be dynamically loaded — try `browser_refresh_refs` or `browser_read_page(refresh=true)` to force a fresh snapshot.
+- Scroll workflow: `browser_read_page` → check content → `browser_scroll("down")` → `browser_read_page` → repeat until found or `at_bottom`.
+
+## UI Interaction Rules (CRITICAL)
+1. Click buttons/links/menus: `click_ui(description="...")` — Accessibility API, exact coordinates
+2. Type in fields: `type_in_field(field_description="...", text="...")` — auto-finds and focuses
+3. Web pages: use `browser_read_page()` to see page content (products, prices, results, text) — it's instant and returns scroll position. Use `browser_click_match(query="...")` for fast clicks. Use `browser_scroll(direction="down")` to scroll pages — NEVER `press_key`. `browser_find` is a SLOW fallback — avoid unless `browser_read_page` + `browser_click_ref` can't resolve
+4. `read_screen` is ONLY for observation ("what's on my screen?") — NEVER for click coordinates
+5. `browser_click`/`browser_fill` are legacy — only when user provides CSS/XPath selectors
+6. NEVER use `run_shell` for browser/UI automation — only for real system/file/terminal tasks
+
+## Google Workspace Rules (CRITICAL)
+For Google Docs, Sheets, Slides, Drive, Gmail, and Calendar — ALWAYS prefer the dedicated `g*` tools:
+- **Docs**: `gdocs_create` / `gdocs_read` / `gdocs_append` / `gdocs_insert_image` — create and populate long documents directly, no browser clicking required.
+- **Sheets**: `gsheets_create` / `gsheets_read` / `gsheets_write` / `gsheets_append_rows` / `gsheets_formula` — write hundreds of rows at once; pass 2D arrays, not one cell at a time.
+- **Slides**: `gslides_create` / `gslides_add_slide` — build presentations slide-by-slide with title+body.
+- **Drive**: `gdrive_search` / `gdrive_upload` — find or upload any file.
+- **Gmail**: `gmail_send` / `gmail_read` / `gmail_draft` — send, search, and draft emails directly.
+- **Calendar**: `gcal_create_event` / `gcal_list_events` — schedule events and list agenda.
+- **Analysis**: `gworkspace_analyze` — read and summarise any open Google Workspace document without copy-paste; stores structured content in memory.
+
+**⚠️ MANDATORY**: When creating or writing Google Docs/Sheets/Slides content, you MUST use these API tools — NEVER use `type_text`, `browser_click_match`, or `browser_type_ref` to type into a Google Workspace editor.
+- To create a new document: `gdocs_create` (NOT `open_url('docs.new')` + `type_text`)
+- To add content: `gdocs_append` (NOT `browser_click_match('editing area')` + `type_text`)
+- To read content: `gdocs_read` or `gworkspace_analyze` (NOT `browser_read_page`)
+Browser automation for Google Workspace is ONLY for UI actions the API can't do (e.g. clicking formatting toolbar buttons, sharing dialogs).
+
+## User Replies
+User replies after `await_reply` are INSTRUCTIONS, not literal text. Interpret intent, fix transcription errors, compose polished text.
+
+## Image Tools (copy / paste images across apps)
+You can copy images from the web or screen and paste them into any app:
+- **`save_image(url)`** — download an image from a URL to a temp file. Returns the local path.
+- **`copy_image_to_clipboard(source)`** — copy an image onto the clipboard. `source` can be a URL or a local file path. Once copied, use `clipboard_ops(action='paste')` to paste it into any app.
+- **`capture_region_screenshot(x, y, width, height)`** — capture a rectangular screen region to a file. Good for grabbing charts, diagrams, or UI elements.
+- **`browser_copy_image(ref_id?, query?)`** — copy an image from the current browser page to clipboard. Use ref_id from `browser_read_page` or describe the image with query.
+- **`clipboard_ops(action='set_image', image_path='...')`** — directly load a local image file onto the clipboard.
+- **`gdocs_insert_image(document_id, image_url)`** — insert an image into Google Docs (requires PUBLIC URL).
+
+### Image Workflow Patterns:
+1. **Web image → any app**: `copy_image_to_clipboard(url)` → `clipboard_ops(paste)` → done
+2. **Browser page image → any app**: `browser_copy_image(query="the logo")` → `clipboard_ops(paste)`
+3. **Screen region → any app**: `capture_region_screenshot(x,y,w,h)` → `copy_image_to_clipboard(path)` → `clipboard_ops(paste)`
+4. **Web image → Google Docs**: `gdocs_insert_image(doc_id, public_url)` (direct API, no clipboard needed)
+- "proceed", "go ahead", "yes", "do it", "approved", "start" → The user has APPROVED a plan. Now execute ALL the steps you proposed. Do NOT call `await_reply` again during execution. Do NOT pause between steps. Run every step in a single plan and call `send_response` only once at the very end with the result.
+- If the user requests MODIFICATIONS ("change step 2", "skip the last one"), adjust the plan and execute the modified version.
+- "cancel", "nevermind", "stop" → Abort. Call `send_response` with a short acknowledgment.
+
+## Communication
+- `send_response`: Final answer (conversation ends). ONLY call when the task is FULLY complete.
+  - One-shot tasks ("open YouTube"): bundle send_response with the action.
+  - Multi-step tasks ("find cheapest X", "search for Y"): do NOT send_response until you have the answer. Keep iterating.
+- `await_reply`: Ask a question and wait for spoken response. NEVER use `await_reply` as a progress update or status message — that's what the "doing" websocket state is for (it happens automatically).
+- NEVER output conversational text directly — ALWAYS use one of these tools
+
+## Plan Approval → Execution Flow
+When you present a `plan` modal via `await_reply` and the user approves:
+1. Generate a COMPLETE execution plan with ALL steps. Include every tool call needed.
+2. Do NOT call `await_reply` between steps — the UI shows "doing" state automatically for each tool.
+3. Only call `send_response` ONCE at the very end (with `steps` modal to summarize what you did, or `text` for a short confirmation).
+4. If something fails mid-execution, use `send_response` to report the error.
+
+## Response Modal Types (IMPORTANT)
+Both `send_response` and `await_reply` accept a `modal` parameter. Pick the best layout for the content:
+- **text** (default): short answers, 1-3 sentences. No extra params needed.
+- **rich**: long-form content (essays, reports, explanations). Add `title`. Use full markdown.
+- **table**: structured data (comparisons, stats, spreadsheets). Provide `headers` and `rows`.
+- **list**: multiple items (search results, recommendations). Provide `items` [{title, description, icon?}].
+- **confirm**: ask user to choose. Provide `actions` [{label, value}]. Stays until user clicks.
+- **media**: show an image or screenshot. Provide `media_url` and optional `caption`.
+- **steps**: summarise a multi-step workflow you completed. Provide `steps` [{label, status: done|current|pending, detail?}].
+- **plan**: present your proposed plan BEFORE acting. Provide `steps` [{label, detail?}]. Use with `await_reply`. The user sees the step rows with a Proceed button and can approve or dismiss (X). The plan modal has NO header — it only shows numbered step rows. If context is needed, use multi-modal to pair a text bubble above it.
+- **cards**: display visual image+text cards for research results, products, homes, articles, etc. Provide `cards` [{name, description?, image?, price?, rating?, reviews?, source?, url?, link?, link_label?}]. Also accepts `title` and `subtitle`. Each card shows image on the left with text on the right. The `url`/`link` param makes the card clickable and adds a "View" pill. `link_label` customizes the pill text (default "View"). Best for: product comparisons, home listings, research results, articles, any visual collection. Backward-compatible as `modal: 'products'` with `products` array.
+
+### Multi-Modal Stacking
+Use the `modals` parameter (array) to show MULTIPLE bubbles stacked vertically.
+Each entry is a complete modal definition with its own `modal` type and fields.
+Example: `modals: [{modal: "text", message: "Here's my plan:"}, {modal: "plan", message: "", steps: [...]}]`
+The plan modal is headerless by design — pair it with a text bubble for descriptions when needed. When the plan is self-explanatory, just send it standalone.
+
+### Persistent Modals
+Plan and confirm modals stay on screen until the user interacts (they do NOT auto-dismiss). Other modals auto-dismiss after a timeout.
+
+### Modal Selection Rules:
+- If the task is **complex (3+ steps) and could have side effects** → use `plan` with `await_reply` first, then execute after approval
+- If you found **products, homes, listings, or visual results** → use `cards`
+- If you found **3+ comparable items** (flights, hotels, stats) → use `table`
+- If you did **3+ sequential actions** → use `steps` to summarise what you did
+- If the answer is **a paragraph or more** → use `rich` with a `title`
+- If you need the user to **choose between options** → use `confirm`
+- If you captured a **screenshot** or have an **image** → use `media`
+- If you have **a list of results** (links, apps, files) → use `list`
+- Short confirmations ("Done!", "Opened YouTube") → use `text` (default)"""
+
+SYSTEM_PROMPT_V2_COMPACT = """You are Moonwalk, a macOS desktop assistant.
+
+## Reasoning Protocol (MANDATORY)
+Before EVERY tool call you MUST include a `reasoning` argument — one sentence
+explaining WHY you are calling that tool and what you expect the result to be.
+
+<thought>
+Before calling any tool, think step-by-step:
+1. What is my current goal?
+2. What do I know from previous tool results?
+3. What is the best next action and why?
+</thought>
+
+You MUST output a <thought> block before each tool call in your response.
+The reasoning argument is your external justification; the thought block is
+your internal chain-of-thought.
+
+Core behavior:
+- Requests are voice-transcribed; correct obvious transcription errors.
+- Resolve references ("it", "that", "go ahead") from conversation history + desktop context.
+- Prefer action over clarification when context resolves ambiguity.
+
+Tooling rules:
+- App/URL control: `open_app`, `open_url`, `quit_app`, `close_window`.
+- UI interaction: prefer `click_ui` and `type_in_field`.
+- Browser interaction: use extension tools (`browser_read_page`, `browser_click_match`, `browser_click_ref`, `browser_type_ref`, `browser_select_ref`).
+- Browser scrolling: use `browser_scroll`, not `press_key`.
+- Use `run_shell` only for real shell/file/system tasks, never for browser/UI automation.
+- For file edits: read first (`read_file`), then mutate (`replace_in_file`/`write_file`).
+- For Google Docs/Sheets/Slides/Gmail/Calendar, prefer dedicated `g*` API tools.
+
+Communication rules:
+- `send_response` is the final user message for completed work.
+- `await_reply` is only for a true blocking question.
+- Do not emit raw conversational text outside these tools.
+"""
+SYSTEM_PROMPT_V2 = SYSTEM_PROMPT_V2_COMPACT
+
+# WebSocket callback type
+WSCallback = Callable[[dict], Awaitable[None]]
+
+
+@dataclass
+class PendingPlanState:
+    """Frozen plan awaiting explicit user approval."""
+    plan_id: str
+    plan: MilestonePlan
+    created_at: float
+    context_fingerprint: dict
+    provider: Optional[LLMProvider]
+    original_user_request: str
+    selected_tools: List[str] = field(default_factory=list)
+    stale_replan_count: int = 0
+
+
+@dataclass
+class PendingExecutionState:
+    """Suspended milestone execution awaiting user follow-up."""
+    execution_id: str
+    plan: MilestonePlan
+    created_at: float
+    provider: Optional[LLMProvider]
+    original_user_request: str
+    selected_tools: List[str] = field(default_factory=list)
+    deliverables: dict[int, str] = field(default_factory=dict)
+    milestone_step_results: dict[int, str] = field(default_factory=dict)
+    milestone_step_result_idx: int = 0
+    suspended_milestone_id: int = 0
+    await_payload: dict = field(default_factory=dict)
+    followup_inputs: List[str] = field(default_factory=list)
+    blocked_await_signatures: List[str] = field(default_factory=list)
+    last_opened_url: str = ""
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Agent V2 Class
+# ═══════════════════════════════════════════════════════════════
+
+class MoonwalkAgentV2:
+    """
+    V2 Agent with Sense-Plan-Act-Verify architecture.
+    
+    Flow:
+    1. SENSE: Build structured WorldState from context
+    2. PLAN: Generate a milestone plan
+    3. ACT: Execute milestones via the LLM micro-loop
+    4. VERIFY: Check success and handle failures
+    """
+
+    def __init__(self, use_planning: bool = True, persist: bool = True):
+        """
+        Initialize the V2 agent.
+        
+        Args:
+            use_planning: If True, use LLM for complex planning. 
+                         If False, use only rule-based templates (faster).
+            persist: If True, persist conversation sessions to disk.
+                    Set False for benchmarks / tests.
+        """
+        # Memory systems
+        self.conversation = ConversationMemory(max_turns=30, idle_timeout=600, persist=persist)
+        self.preferences = UserPreferences()
+        self.user_profile = UserProfile()
+        self.task_store = TaskStore()
+        self.working_memory = WorkingMemory(max_actions=40, max_entities=60)
+        
+        # Routing
+        self.router = ModelRouter()
+        self._pending_reply_provider: Optional[LLMProvider] = None
+        
+        # V2 components
+        self.intent_parser = IntentParser()
+        self.entity_extractor = EntityExtractor()
+        self.tool_selector = get_tool_selector(tool_registry)
+        self.verifier = get_verifier()
+        self.planner: Optional[TaskPlanner] = None  # Lazy init with provider
+        self._pending_plan: Optional[PendingPlanState] = None
+        self._pending_execution: Optional[PendingExecutionState] = None
+        self._last_opened_url: str = ""
+        
+        # Configuration
+        self.use_planning = use_planning
+
+    def _build_system_prompt(self) -> str:
+        """Build the system prompt with user preferences, profile, and working memory."""
+        prompt = SYSTEM_PROMPT_V2
+        prefs = self.preferences.to_prompt_string()
+        if prefs:
+            prompt += f"\n\n{prefs}"
+        profile = self.user_profile.to_prompt_string()
+        if profile:
+            prompt += f"\n\n{profile}"
+        # Inject working memory (recent actions, entities, session goal)
+        wm = self.working_memory.to_prompt_string()
+        if wm:
+            prompt += f"\n\n{wm}"
+        return prompt
+
+    def _context_fingerprint(self, context: perception.ContextSnapshot) -> dict:
+        app = (context.active_app or "").strip().lower()
+        domain = ""
+        if context.browser_url:
+            try:
+                domain = (urlparse(context.browser_url).netloc or "").lower()
+            except Exception:
+                domain = ""
+        return {
+            "active_app": app,
+            "browser_domain": domain,
+        }
+
+    def _classify_pending_followup(self, text: str) -> str:
+        normalized = " ".join((text or "").strip().lower().split())
+        if not normalized:
+            return "modify"
+        import re
+
+        def _has_term(term: str) -> bool:
+            if " " in term:
+                return term in normalized
+            return re.search(rf"\b{re.escape(term)}\b", normalized) is not None
+
+        cancel_terms = (
+            "cancel",
+            "never mind",
+            "nevermind",
+            "stop",
+            "abort",
+            "dismiss",
+            "don't",
+            "do not",
+            "no thanks",
+            "no",
+        )
+        modify_terms = (
+            "change",
+            "modify",
+            "instead",
+            "but",
+            "except",
+            "skip",
+            "remove",
+            "add",
+            "edit",
+            "update",
+        )
+        approve_terms = (
+            "proceed",
+            "go ahead",
+            "yes",
+            "approved",
+            "approve",
+            "start",
+            "continue",
+            "do it",
+            "looks good",
+            "ok",
+            "okay",
+        )
+        if any(_has_term(term) for term in cancel_terms):
+            return "cancel"
+        if any(_has_term(term) for term in modify_terms):
+            return "modify"
+        if any(_has_term(term) for term in approve_terms):
+            return "approve"
+        return "modify"
+
+    def _recent_conversation_snippet(self) -> str:
+        recent_turns = self.conversation.get_history()[-6:]
+        return " ".join(
+            p.get("text", "") for t in recent_turns
+            for p in (t.get("parts") or []) if isinstance(p, dict) and "text" in p
+        )
+
+    def _current_tool_gateway_context(self) -> dict:
+        """Collect live browser bridge state for gateway routing."""
+        try:
+            from browser.bridge import browser_bridge
+            from browser.store import browser_store
+        except Exception:
+            return {
+                "browser_bridge_connected": False,
+                "browser_has_snapshot": False,
+                "browser_session_id": "",
+            }
+
+        snapshot = browser_store.get_snapshot()
+        session_id = (
+            str(browser_bridge.connected_session_id() or "").strip()
+            or str(getattr(snapshot, "session_id", "") or "").strip()
+        )
+        return {
+            "browser_bridge_connected": bool(browser_bridge.is_connected()),
+            "browser_has_snapshot": snapshot is not None,
+            "browser_session_id": session_id,
+        }
+
+    def _select_tool_surface(
+        self,
+        user_request: str,
+        context: perception.ContextSnapshot,
+        world_state: Optional[WorldState] = None,
+    ) -> tuple[list[str], list[dict]]:
+        intent = getattr(world_state, "intent", None) if world_state else None
+        if intent is None or intent.action == IntentAction.UNKNOWN:
+            try:
+                intent = self.intent_parser.parse(user_request)
+            except Exception:
+                intent = None
+        selected_tools = self.tool_selector.select(
+            user_request=user_request,
+            context_app=context.active_app or "",
+            context_url=context.browser_url or "",
+            conversation_history=self._recent_conversation_snippet(),
+            clipboard_content=context.clipboard or "",
+            selected_text=getattr(context, "selected_text", None) or "",
+            intent_action=intent.action.value if intent else "",
+            intent_target_type=intent.target_type.value if intent else "",
+            intent_target_value=intent.target_value if intent else "",
+        )
+        llm_tool_declarations = self.tool_selector.get_llm_tool_declarations(selected_tools)
+        return selected_tools, llm_tool_declarations
+
+    def _llm_tool_names(self, llm_tool_declarations: Optional[list[dict]]) -> set[str]:
+        return {
+            str(decl.get("name", "")).strip()
+            for decl in (llm_tool_declarations or [])
+            if str(decl.get("name", "")).strip()
+        }
+
+    def _unsupported_plan_hints(
+        self,
+        plan: MilestonePlan,
+        llm_tool_declarations: Optional[list[dict]],
+    ) -> list[tuple[int, str, list[str]]]:
+        allowed = self._llm_tool_names(llm_tool_declarations)
+        issues: list[tuple[int, str, list[str]]] = []
+        for milestone in plan.milestones:
+            hinted = sorted({
+                str(tool).strip()
+                for tool in (milestone.hint_tools or [])
+                if str(tool).strip() and str(tool).strip() not in {"send_response", "await_reply"}
+            })
+            missing = [tool for tool in hinted if tool not in allowed]
+            if missing:
+                issues.append((milestone.id, milestone.goal, missing))
+        return issues
+
+    def _enforce_plan_tool_contract(
+        self,
+        plan: MilestonePlan,
+        llm_tool_declarations: Optional[list[dict]],
+    ) -> MilestonePlan:
+        issues = self._unsupported_plan_hints(plan, llm_tool_declarations)
+        if not issues:
+            return plan
+
+        fragments = []
+        for milestone_id, goal, missing in issues[:3]:
+            label = goal or f"Milestone {milestone_id}"
+            fragments.append(f"{label} requires {', '.join(missing)}")
+        clarification = (
+            "I can’t execute the current plan with the tools available for this request. "
+            f"{'; '.join(fragments)}. Please provide the missing source or rephrase the task."
+        )
+        return MilestonePlan(
+            task_summary=plan.task_summary,
+            needs_clarification=True,
+            clarification_prompt=clarification,
+            final_response=plan.final_response,
+            skill_context=getattr(plan, "skill_context", ""),
+            skills_used=list(getattr(plan, "skills_used", [])),
+            source=f"{getattr(plan, 'source', 'milestone_planner')}_tool_contract",
+        )
+
+    def _is_pending_plan_stale(self, pending: PendingPlanState, context: perception.ContextSnapshot) -> tuple[bool, str]:
+        age = _time.time() - pending.created_at
+        if age > PENDING_PLAN_TTL_SECONDS:
+            return True, f"older than {PENDING_PLAN_TTL_SECONDS}s"
+
+        current_fp = self._context_fingerprint(context)
+        old_app = pending.context_fingerprint.get("active_app", "")
+        new_app = current_fp.get("active_app", "")
+        plan_tools = self._planned_tool_names(pending.plan)
+        is_web_flow_plan = bool(plan_tools.intersection(WEB_FLOW_TOOLS))
+        if old_app and new_app and old_app != new_app:
+            # Approval can be spoken/typed via Moonwalk's Electron panel while the
+            # original browser task context is still valid. Don't invalidate for that.
+            if is_web_flow_plan and old_app in BROWSER_APP_NAMES and new_app in {"electron", "moonwalk"}:
+                pass
+            elif is_web_flow_plan and old_app in BROWSER_APP_NAMES and new_app in BROWSER_APP_NAMES:
+                pass
+            else:
+                return True, "active app changed"
+
+        old_domain = pending.context_fingerprint.get("browser_domain", "")
+        new_domain = current_fp.get("browser_domain", "")
+        if old_domain and new_domain and old_domain != new_domain:
+            return True, "browser domain changed"
+
+        return False, ""
+
+    def _planned_tool_names(self, plan: MilestonePlan) -> set[str]:
+        planned_tools: set[str] = set()
+        for milestone in plan.milestones:
+            planned_tools.update(
+                str(tool).strip()
+                for tool in milestone.hint_tools
+                if str(tool).strip()
+            )
+        return planned_tools
+
+    def _plan_unit_count(self, plan: MilestonePlan) -> int:
+        return len(plan.milestones)
+
+    def _should_gate_plan(self, plan: MilestonePlan) -> bool:
+        communication_tools = {"send_response", "await_reply"}
+        read_only_tools = {
+            "read_file",
+            "read_screen",
+            "get_ui_tree",
+            "browser_snapshot",
+            "browser_read_page",
+            "browser_find",
+            "browser_describe_ref",
+            "browser_list_tabs",
+            "gdocs_read",
+            "gsheets_read",
+            "gdrive_search",
+            "gmail_read",
+            "gcal_list_events",
+            "gworkspace_analyze",
+            "list_directory",
+            "get_web_information",
+            "fetch_web_content",
+            "web_scrape",
+            "web_search",
+            "read_page_content",
+            "extract_structured_data",
+            "get_page_summary",
+        }
+        high_risk_tools = {
+            "write_file",
+            "replace_in_file",
+            "run_shell",
+            "browser_click_ref",
+            "browser_type_ref",
+            "browser_select_ref",
+            "browser_click_match",
+            "browser_click",
+            "browser_fill",
+            "click_ui",
+            "type_in_field",
+            "click_element",
+            "type_text",
+            "press_key",
+            "mouse_action",
+            "gdocs_create",
+            "gdocs_append",
+            "gdocs_insert_image",
+            "gsheets_create",
+            "gsheets_write",
+            "gsheets_append_rows",
+            "gsheets_formula",
+            "gslides_create",
+            "gslides_add_slide",
+            "gdrive_upload",
+            "gmail_send",
+            "gmail_draft",
+            "gcal_create_event",
+        }
+        medium_risk_tools = {
+            "open_url",
+            "open_app",
+            "quit_app",
+            "close_window",
+            "window_manager",
+            "save_image",
+            "clipboard_ops",
+        }
+        side_effect_tools = high_risk_tools | medium_risk_tools
+
+        planned_tools = self._planned_tool_names(plan)
+        if not planned_tools:
+            return False
+
+        if all(tool in read_only_tools for tool in planned_tools):
+            return False
+
+        if self._plan_unit_count(plan) == 1 and planned_tools.issubset(medium_risk_tools):
+            return False
+
+        if any(tool in high_risk_tools for tool in planned_tools):
+            return True
+
+        has_side_effect = any(tool in side_effect_tools for tool in planned_tools)
+        if self._plan_unit_count(plan) >= 3 and has_side_effect:
+            return True
+        return False
+
+    def _modal_steps_from_plan(self, plan: MilestonePlan) -> list[dict]:
+        """Build compressed plan phases for the UI modal.
+        
+        Groups related steps into logical phases so the user sees a clean
+        high-level summary.  The agent treats the full plan as a reference —
+        actual execution adapts based on what it observes.
+        """
+        return [
+            {
+                "label": milestone.goal or f"Milestone {milestone.id}",
+                "detail": milestone.success_signal or ", ".join(milestone.hint_tools) or "Complete this goal",
+            }
+            for milestone in plan.milestones
+        ]
+
+    async def _show_plan_gate(
+        self,
+        pending: PendingPlanState,
+        context: perception.ContextSnapshot,
+        provider: LLMProvider,
+        ws_callback: Optional[WSCallback],
+        note: str = "",
+    ) -> tuple[str, bool]:
+        steps_payload = self._modal_steps_from_plan(pending.plan)
+        message = "Review this plan and choose Proceed to execute it."
+        if note:
+            message = f"{note}\n\n{message}"
+
+        await_payload = {
+            "message": message,
+            "modal": "plan",
+            "steps": steps_payload,
+            "plan_id": pending.plan_id,
+        }
+        raw = await tool_registry.execute("await_reply", await_payload)
+
+        await_msg = message
+        await_modal_data = None
+        if isinstance(raw, str) and raw.startswith("AWAIT:"):
+            parsed = raw[len("AWAIT:"):]
+            try:
+                await_modal_data = json.loads(parsed)
+                await_msg = await_modal_data.get("message", await_msg)
+            except (json.JSONDecodeError, TypeError):
+                await_msg = parsed or await_msg
+
+        self._pending_reply_provider = provider
+        self.conversation.add_model(await_msg)
+
+        if ws_callback:
+            payload = {
+                "type": "response",
+                "payload": {
+                    "text": await_msg,
+                    "display": "card",
+                    "await_input": True,
+                    "app": context.active_app.lower() if context.active_app else "",
+                },
+            }
+            if await_modal_data:
+                payload["payload"]["modal_data"] = await_modal_data
+            await ws_callback(payload)
+
+        return (await_msg, True)
+
+    async def run(
+        self,
+        user_text: str,
+        context: perception.ContextSnapshot,
+        ws_callback: Optional[WSCallback] = None,
+    ) -> tuple:
+        """
+        Main entry point for V2 agent.
+        
+        Args:
+            user_text: User's request text
+            context: Current desktop context from perception layer
+            ws_callback: WebSocket callback for streaming updates
+            
+        Returns:
+            Tuple of (response_text, awaiting_reply)
+        """
+        t_start = _time.time()
+        print(f"\n[AgentV2] ═══ New Request ═══")
+        print(f"[AgentV2] Text: '{user_text}'")
+        print(f"[AgentV2] Context: app={context.active_app}, title={context.window_title}")
+
+        # Record user turn in conversation memory (for multi-turn context)
+        self.conversation.add_user(user_text)
+
+        # Extract facts from user message into persistent profile
+        extracted = self.user_profile.extract_facts(user_text)
+        if extracted:
+            print(f"[AgentV2] 📝 Extracted facts: {extracted}")
+
+        # Stream "thinking" state to UI
+        if ws_callback:
+            await ws_callback({"type": "thinking"})
+
+        # ══════════════════════════════════════════════════════════════
+        # PHASE 1: SENSE — Build structured WorldState
+        # ══════════════════════════════════════════════════════════════
+        world_state = await self._build_world_state(user_text, context)
+        gateway_context = self._current_tool_gateway_context()
+        set_tool_gateway_context(
+            active_app=world_state.active_app,
+            browser_url=world_state.browser_url or "",
+            background_mode=False,
+            browser_bridge_connected=gateway_context["browser_bridge_connected"],
+            browser_has_snapshot=gateway_context["browser_has_snapshot"],
+            browser_session_id=gateway_context["browser_session_id"],
+        )
+        print(f"[AgentV2] Intent: {world_state.intent.action.value if world_state.intent else 'unknown'}")
+
+        planning_request = user_text
+
+        if self._pending_execution:
+            pending_execution = self._pending_execution
+            age = _time.time() - pending_execution.created_at
+            if age > PENDING_PLAN_TTL_SECONDS:
+                print(f"[AgentV2] Pending execution expired after {age:.1f}s; discarding state.")
+                self._pending_execution = None
+            else:
+                followup = self._classify_pending_followup(user_text)
+                print(f"[AgentV2] Pending execution follow-up: {followup} ({pending_execution.execution_id})")
+
+                if followup == "cancel":
+                    self._pending_execution = None
+                    cancel_message = "Cancelled the in-progress task."
+                    try:
+                        await tool_registry.execute("send_response", {"message": cancel_message})
+                    except Exception:
+                        pass
+                    if ws_callback:
+                        await ws_callback({
+                            "type": "response",
+                            "payload": {
+                                "text": cancel_message,
+                                "display": "card",
+                                "app": context.active_app.lower() if context.active_app else "",
+                            }
+                        })
+                    self.conversation.add_model(cancel_message)
+                    return (cancel_message, False)
+
+                provider = pending_execution.provider
+                if provider is None:
+                    try:
+                        decision = await self.router.route(
+                            pending_execution.original_user_request,
+                            context_summary=f"App: {context.active_app}, Window: {context.window_title}",
+                            has_screenshot=context.screenshot_path is not None,
+                        )
+                        provider = decision.provider
+                    except RuntimeError as e:
+                        error_msg = str(e)
+                        if ws_callback:
+                            await ws_callback({
+                                "type": "response",
+                                "payload": {"text": error_msg}
+                            })
+                        return (error_msg, False)
+
+                resume_inputs = list(pending_execution.followup_inputs or [])
+                if user_text:
+                    resume_inputs.append(user_text)
+                resume_request = pending_execution.original_user_request
+                if resume_inputs:
+                    resume_request = (
+                        f"{pending_execution.original_user_request}\n\n"
+                        "User follow-up:\n"
+                        + "\n".join(resume_inputs)
+                    )
+
+                selected_tools, llm_tool_declarations = self._select_tool_surface(
+                    resume_request,
+                    context,
+                    world_state,
+                )
+                pending_execution.plan = self._enforce_plan_tool_contract(
+                    pending_execution.plan,
+                    llm_tool_declarations,
+                )
+                if pending_execution.plan.needs_clarification:
+                    self._pending_execution = None
+                    result = await self._handle_clarification(
+                        pending_execution.plan.clarification_prompt,
+                        provider,
+                        context,
+                        ws_callback,
+                    )
+                    return result
+
+                pending_execution.provider = provider
+                pending_execution.selected_tools = list(selected_tools)
+                pending_execution.followup_inputs = resume_inputs
+                self._pending_execution = None
+
+                final_response, awaiting = await self._execute_milestone_plan(
+                    plan=pending_execution.plan,
+                    world_state=world_state,
+                    provider=provider,
+                    context=context,
+                    user_text=resume_request,
+                    llm_tool_declarations=llm_tool_declarations,
+                    ws_callback=ws_callback,
+                    pending_execution=pending_execution,
+                    followup_inputs=resume_inputs,
+                )
+                print(f"[AgentV2] ⏱ TOTAL: {_time.time() - t_start:.2f}s")
+                return (final_response, awaiting)
+
+        # Pending-plan follow-up handling (approve/cancel/modify)
+        if self._pending_plan:
+            pending = self._pending_plan
+            followup = self._classify_pending_followup(user_text)
+            print(f"[AgentV2] Pending plan follow-up: {followup} ({pending.plan_id})")
+
+            if followup == "cancel":
+                self._pending_plan = None
+                cancel_message = "Plan cancelled."
+                try:
+                    await tool_registry.execute("send_response", {"message": cancel_message})
+                except Exception:
+                    pass
+                if ws_callback:
+                    await ws_callback({
+                        "type": "response",
+                        "payload": {
+                            "text": cancel_message,
+                            "display": "card",
+                            "app": context.active_app.lower() if context.active_app else "",
+                        }
+                    })
+                self.conversation.add_model(cancel_message)
+                return (cancel_message, False)
+
+            if followup == "approve":
+                stale, stale_reason = self._is_pending_plan_stale(pending, context)
+                if stale and pending.stale_replan_count < 1 and self.use_planning:
+                    print(f"[AgentV2] Pending plan stale ({stale_reason}); regenerating once.")
+                    self._pending_plan = None
+
+                    provider = pending.provider
+                    if provider is None:
+                        decision = await self.router.route(
+                            pending.original_user_request,
+                            context_summary=f"App: {context.active_app}, Window: {context.window_title}",
+                            has_screenshot=context.screenshot_path is not None,
+                        )
+                        provider = decision.provider
+
+                    if self.planner is None:
+                        self.planner = TaskPlanner(provider=provider, tool_registry=tool_registry)
+                    else:
+                        self.planner.provider = provider
+
+                    selected_tools, llm_tool_declarations = self._select_tool_surface(
+                        pending.original_user_request,
+                        context,
+                        world_state,
+                    )
+                    if ws_callback:
+                        await ws_callback({"type": "doing", "text": "Refreshing plan due to context change...", "tool": "planner"})
+
+                    refreshed_plan = await self.planner.create_milestone_plan(
+                        user_request=pending.original_user_request,
+                        world_state=world_state,
+                        conversation_history=self.conversation.get_history(),
+                        available_tools=selected_tools,
+                    )
+                    if refreshed_plan is None:
+                        refreshed_plan = MilestonePlan(
+                            task_summary=pending.original_user_request,
+                            needs_clarification=True,
+                            clarification_prompt="I couldn't refresh the plan. Please try again.",
+                        )
+                    refreshed_plan = self._enforce_plan_tool_contract(refreshed_plan, llm_tool_declarations)
+                    if refreshed_plan.needs_clarification:
+                        result = await self._handle_clarification(
+                            refreshed_plan.clarification_prompt,
+                            provider,
+                            context,
+                            ws_callback,
+                        )
+                        return result
+
+                    refreshed_pending = PendingPlanState(
+                        plan_id=uuid.uuid4().hex[:10],
+                        plan=refreshed_plan,
+                        created_at=_time.time(),
+                        context_fingerprint=self._context_fingerprint(context),
+                        provider=provider,
+                        original_user_request=pending.original_user_request,
+                        selected_tools=list(selected_tools),
+                        stale_replan_count=pending.stale_replan_count + 1,
+                    )
+                    self._pending_plan = refreshed_pending
+                    result = await self._show_plan_gate(
+                        pending=refreshed_pending,
+                        context=context,
+                        provider=provider,
+                        ws_callback=ws_callback,
+                        note="Context changed since the original plan, so I refreshed it.",
+                    )
+                    return result
+
+                if stale:
+                    print(f"[AgentV2] Pending plan stale ({stale_reason}) but refresh already used; executing frozen plan.")
+
+                provider = pending.provider
+                if provider is None:
+                    try:
+                        decision = await self.router.route(
+                            pending.original_user_request,
+                            context_summary=f"App: {context.active_app}, Window: {context.window_title}",
+                            has_screenshot=context.screenshot_path is not None,
+                        )
+                        provider = decision.provider
+                    except RuntimeError as e:
+                        error_msg = str(e)
+                        if ws_callback:
+                            await ws_callback({
+                                "type": "response",
+                                "payload": {"text": error_msg}
+                            })
+                        return (error_msg, False)
+
+                self._pending_plan = None
+                print(f"[AgentV2] Executing frozen approved plan: {pending.plan.task_summary}")
+                llm_tool_declarations = self.tool_selector.get_llm_tool_declarations(pending.selected_tools)
+                final_response, awaiting = await self._execute_milestone_plan(
+                    plan=pending.plan,
+                    world_state=world_state,
+                    provider=provider,
+                    context=context,
+                    user_text=pending.original_user_request,
+                    llm_tool_declarations=llm_tool_declarations,
+                    ws_callback=ws_callback,
+                )
+                print(f"[AgentV2] ⏱ TOTAL: {_time.time() - t_start:.2f}s")
+                return (final_response, awaiting)
+
+            # Modification path: clear frozen plan and replan with explicit plan context.
+            previous_plan = pending.plan.to_prompt_string()
+            previous_request = pending.original_user_request
+            self._pending_plan = None
+            planning_request = (
+                f"{user_text}\n\n"
+                "Previous proposed plan (modify this):\n"
+                f"{previous_plan}\n\n"
+                "Original request:\n"
+                f"{previous_request}"
+            )
+            print("[AgentV2] Replanning from user modifications to pending plan.")
+
+        # ══════════════════════════════════════════════════════════════
+        # ROUTING — Select model tier
+        # ══════════════════════════════════════════════════════════════
+        if self._pending_reply_provider:
+            provider = self._pending_reply_provider
+            self._pending_reply_provider = None
+            print(f"[AgentV2] Resuming with {provider.name}")
+        else:
+            try:
+                decision = await self.router.route(
+                    planning_request,
+                    context_summary=f"App: {context.active_app}, Window: {context.window_title}",
+                    has_screenshot=context.screenshot_path is not None,
+                )
+                provider = decision.provider
+                print(f"[AgentV2] Using {provider.name} ({decision.reason})")
+            except RuntimeError as e:
+                error_msg = str(e)
+                if ws_callback:
+                    await ws_callback({
+                        "type": "response",
+                        "payload": {"text": error_msg}
+                    })
+                return (error_msg, False)
+
+        # Initialize planner with provider
+        if self.planner is None:
+            self.planner = TaskPlanner(provider=provider, tool_registry=tool_registry)
+        else:
+            self.planner.provider = provider
+
+        world_state.task_graph = self.planner.intent_parser.extract_task_graph(
+            planning_request,
+            world_state,
+        )
+
+        # ══════════════════════════════════════════════════════════════
+        # PHASE 2: PLAN — Generate execution plan
+        # ══════════════════════════════════════════════════════════════
+        # Build a short conversation summary for the tool selector.
+        # Critical for follow-ups like "proceed" after a plan — without this,
+        # the selector only sees "proceed" and loses the original intent
+        # (e.g. "create a Google Doc"), so specialised tools get dropped.
+        selected_tools, llm_tool_declarations = self._select_tool_surface(
+            planning_request,
+            context,
+            world_state,
+        )
+
+        if ws_callback:
+            await ws_callback({"type": "doing", "text": "Planning milestones…", "tool": "planner"})
+
+        milestone_plan = await self.planner.create_milestone_plan(
+            user_request=planning_request,
+            world_state=world_state,
+            conversation_history=self.conversation.get_history(),
+            available_tools=selected_tools,
+        )
+        if milestone_plan is None:
+            milestone_plan = MilestonePlan(
+                task_summary=planning_request,
+                needs_clarification=True,
+                clarification_prompt="I couldn't generate a milestone plan for that. Please try rephrasing it.",
+            )
+        milestone_plan = self._enforce_plan_tool_contract(milestone_plan, llm_tool_declarations)
+
+        print(f"[AgentV2] Milestone plan: {milestone_plan.task_summary} "
+              f"({len(milestone_plan.milestones)} milestones)")
+
+        # Handle clarification needed
+        if milestone_plan.needs_clarification:
+            result = await self._handle_clarification(
+                milestone_plan.clarification_prompt,
+                provider, 
+                context, 
+                ws_callback
+            )
+            return result
+
+        if self._should_gate_plan(milestone_plan):
+            pending = PendingPlanState(
+                plan_id=uuid.uuid4().hex[:10],
+                plan=milestone_plan,
+                created_at=_time.time(),
+                context_fingerprint=self._context_fingerprint(context),
+                provider=provider,
+                original_user_request=planning_request,
+                selected_tools=list(selected_tools),
+            )
+            self._pending_plan = pending
+            print(f"[AgentV2] Plan gated for approval: {pending.plan_id}")
+            result = await self._show_plan_gate(
+                pending=pending,
+                context=context,
+                provider=provider,
+                ws_callback=ws_callback,
+            )
+            print(f"[AgentV2] ⏱ TOTAL: {_time.time() - t_start:.2f}s")
+            return result
+
+        # ══════════════════════════════════════════════════════════════
+        # PHASE 3 & 4: ACT + VERIFY — Execute milestone plan
+        # ══════════════════════════════════════════════════════════════
+        final_response, awaiting = await self._execute_milestone_plan(
+            plan=milestone_plan,
+            world_state=world_state,
+            provider=provider,
+            context=context,
+            user_text=planning_request,
+            llm_tool_declarations=llm_tool_declarations,
+            ws_callback=ws_callback
+        )
+
+        print(f"[AgentV2] ⏱ TOTAL: {_time.time() - t_start:.2f}s")
+
+        return (final_response, awaiting)
+
+    async def _build_world_state(
+        self,
+        user_text: str,
+        context: perception.ContextSnapshot
+    ) -> WorldState:
+        """Build structured WorldState from context and user text."""
+        
+        # Extract entities from user text
+        entities = self.entity_extractor.extract(user_text)
+        
+        # Parse intent
+        intent = self.intent_parser.parse(user_text)
+        
+        # Build world state
+        world_state = WorldState(
+            # Desktop state
+            active_app=context.active_app or "",
+            window_title=context.window_title or "",
+            browser_url=context.browser_url,
+            
+            # Extracted entities
+            mentioned_apps=entities.get("apps", []),
+            mentioned_files=entities.get("files", []),
+            mentioned_urls=entities.get("urls", []),
+            
+            # Clipboard
+            clipboard_content=context.clipboard,
+            
+            # Selected text
+            selected_text=getattr(context, 'selected_text', None),
+            
+            # Screenshot
+            has_screenshot=context.screenshot_path is not None,
+            screenshot_path=context.screenshot_path,
+            
+            # Intent
+            intent=intent,
+            
+            # Metadata
+            timestamp=context.timestamp
+        )
+        
+        return world_state
+
+    async def _handle_clarification(
+        self,
+        prompt: str,
+        provider: LLMProvider,
+        context: perception.ContextSnapshot,
+        ws_callback: Optional[WSCallback]
+    ) -> tuple:
+        """Handle a request that needs clarification."""
+        print(f"[AgentV2] ⏳ Awaiting clarification: {prompt}")
+        
+        # Add to conversation memory
+        self.conversation.add_model(prompt)
+        
+        # Lock provider for follow-up
+        self._pending_reply_provider = provider
+        
+        if ws_callback:
+            await ws_callback({
+                "type": "response",
+                "payload": {
+                    "text": prompt,
+                    "display": "card",
+                    "await_input": True,
+                    "app": context.active_app.lower() if context.active_app else ""
+                }
+            })
+        
+        return (prompt, True)
+
+    # ═══════════════════════════════════════════════════════════════
+    #  Adaptive Plan Execution (LLM-in-the-loop)
+    # ═══════════════════════════════════════════════════════════════
+
+    async def _perceive_environment(self, followup_inputs: Optional[list[str]] = None) -> dict:
+        """Quick perception of the current desktop/browser state for step reasoning."""
+        env: dict = {}
+        try:
+            active_app, window_title, clipboard = await asyncio.gather(
+                perception.get_active_app(),
+                perception.get_window_title(),
+                perception.get_clipboard(),
+            )
+            env["active_app"] = active_app
+            env["window_title"] = window_title
+            if clipboard:
+                env["clipboard"] = clipboard[:500]
+            if active_app.lower() in perception.BROWSERS:
+                browser_url, selected_text = await asyncio.gather(
+                    perception.get_browser_url(active_app),
+                    perception.get_browser_selected_text(active_app),
+                )
+                env["browser_url"] = browser_url or ""
+                if selected_text:
+                    env["selected_text"] = selected_text[:500]
+        except Exception as e:
+            print(f"[AgentV2] ⚠ Perception failed: {e}")
+        if followup_inputs:
+            env["user_followups"] = " || ".join(text[:200] for text in followup_inputs if text)
+        last_typed_text = self.working_memory.get_last_typed_text()
+        if last_typed_text:
+            env["last_typed_text"] = last_typed_text[:500]
+        search_leads = self.working_memory.get_search_leads()
+        if search_leads:
+            env["search_lead_count"] = len(search_leads)
+            top_leads = []
+            for lead in search_leads[-3:]:
+                title = str(lead.get("title", "")).strip()
+                domain = str(lead.get("domain", "")).strip()
+                status = "opened" if lead.get("opened") else "unopened"
+                row = " | ".join(part for part in (title, domain, status) if part)
+                if row:
+                    top_leads.append(row[:180])
+            if top_leads:
+                env["search_leads"] = " || ".join(top_leads)
+        return env
+
+    # ═══════════════════════════════════════════════════════════════
+    #  Milestone-Based Execution (LLM micro-loop per milestone)
+    # ═══════════════════════════════════════════════════════════════
+
+    async def _execute_milestone_plan(
+        self,
+        plan: MilestonePlan,
+        world_state: WorldState,
+        provider: LLMProvider,
+        context: perception.ContextSnapshot,
+        user_text: str,
+        llm_tool_declarations: Optional[list[dict]],
+        ws_callback: Optional[WSCallback],
+        pending_execution: Optional[PendingExecutionState] = None,
+        followup_inputs: Optional[list[str]] = None,
+    ) -> tuple:
+        """Execute a milestone-based plan using the LLM micro-loop.
+
+        Each milestone is executed autonomously — the LLM decides tool calls
+        within the milestone's scope until the success_signal is met or
+        the runtime safety cap is reached.
+
+        Returns:
+            Tuple of (final_response, awaiting_reply)
+        """
+        from agent.milestone_executor import get_milestone_executor
+
+        t_start = _time.time()
+        executor = get_milestone_executor(provider, llm_tool_declarations or tool_registry.declarations())
+        request_scope_tool_names = {
+            str(decl.get("name", "")).strip()
+            for decl in (llm_tool_declarations or tool_registry.declarations())
+            if str(decl.get("name", "")).strip()
+        }
+        deliverables: dict[int, str] = dict(pending_execution.deliverables) if pending_execution else {}
+        milestone_step_results: dict[int, str] = (
+            dict(pending_execution.milestone_step_results) if pending_execution else {}
+        )
+        milestone_step_result_idx = pending_execution.milestone_step_result_idx if pending_execution else 0
+        blocked_await_signatures = set(pending_execution.blocked_await_signatures or []) if pending_execution else set()
+        followup_inputs = list(
+            followup_inputs
+            or (pending_execution.followup_inputs if pending_execution else [])
+            or []
+        )
+        last_await_payload: Optional[dict] = dict(pending_execution.await_payload) if pending_execution else None
+        self._last_opened_url = pending_execution.last_opened_url if pending_execution else ""
+        self._last_modal_data: Optional[dict] = None
+
+        print(f"\n[AgentV2] ═══ Milestone Plan: {plan.task_summary} ═══")
+        print(f"[AgentV2]   Milestones: {len(plan.milestones)}")
+        for m in plan.milestones:
+            deps = f" (depends: {m.depends_on})" if m.depends_on else ""
+            print(f"[AgentV2]   [{m.id}] {m.goal} — signal: {m.success_signal}{deps}")
+        print(f"[AgentV2] ═══{'═' * 50}═══\n")
+
+        is_research = self._looks_like_research_doc_task(user_text, plan.task_summary or "")
+
+        # Track whether the last tool was UI-mutating (drives passive visual injection)
+        last_tool_was_ui_mutating = False
+
+        async def milestone_visual_context() -> str:
+            """Gather DOM snapshot + screenshot description for passive injection."""
+            parts: list[str] = []
+            try:
+                from browser.store import browser_store
+                snap = browser_store.get_snapshot()
+                if snap and snap.elements:
+                    dom_lines = [f"Page: {snap.title} ({snap.url})"]
+                    for el in snap.elements[:30]:
+                        label = el.primary_label()[:60] if el.primary_label() else el.tag
+                        dom_lines.append(f"  [{el.ref_id}] {el.role or el.tag}: {label}")
+                    parts.append("\n".join(dom_lines))
+            except Exception as e:
+                print(f"[AgentV2] ⚠ DOM snapshot for visual context failed: {e}")
+
+            try:
+                screenshot_path = await perception.capture_screenshot()
+                if screenshot_path:
+                    parts.append(f"Screenshot captured: {screenshot_path}")
+            except Exception as e:
+                print(f"[AgentV2] ⚠ Screenshot for visual context failed: {e}")
+
+            return "\n".join(parts) if parts else ""
+
+        async def milestone_env_perceiver() -> dict:
+            env = await self._perceive_environment(followup_inputs=followup_inputs)
+            # Passive visual injection: only after UI-mutating tools
+            if last_tool_was_ui_mutating:
+                try:
+                    visual = await milestone_visual_context()
+                    if visual:
+                        env["visual_state"] = visual[:1500]
+                except Exception as e:
+                    print(f"[AgentV2] ⚠ Passive visual injection failed: {e}")
+            return env
+
+        # Build tool-executor closure that reuses the existing step infrastructure
+        async def tool_executor(tool: str, args: dict) -> tuple[str, bool]:
+            nonlocal milestone_step_result_idx
+            nonlocal last_await_payload
+
+            # Research synthesis for writing tools
+            _WRITING_FIELDS = {
+                "gdocs_create": "body",
+                "gdocs_append": "text",
+                "write_file": "content",
+            }
+            target_field = _WRITING_FIELDS.get(tool)
+            if target_field and is_research:
+                snippets = self._collect_research_snippets(milestone_step_results)
+                if snippets:
+                    try:
+                        synthesized = await self._synthesize_research_body(
+                            provider=provider,
+                            user_text=user_text,
+                            task_summary=plan.task_summary or "",
+                            snippets=snippets,
+                        )
+                        if synthesized:
+                            # For research tasks, writing tools should use synthesized
+                            # content from collected snippets instead of LLM filler text.
+                            args[target_field] = synthesized
+                            print(f"[AgentV2] 📝 Synthesized research for {tool} ({len(synthesized)} chars)")
+                    except Exception as e:
+                        print(f"[AgentV2] ⚠ Research synthesis failed: {e}")
+
+            temp_step = ExecutionStep(
+                id=0, tool=tool, args=dict(args),
+                description=f"{tool}",
+            )
+            success = await self._execute_step(
+                temp_step, world_state, ws_callback,
+                user_text=user_text,
+                task_summary=plan.task_summary or "",
+            )
+            result = str(temp_step.result or "") if success else str(temp_step.error or "")
+
+            if success and tool == "send_response" and temp_step.modal_data:
+                self._last_modal_data = temp_step.modal_data
+
+            if success and tool == "await_reply":
+                last_await_payload = dict(temp_step.modal_data or {})
+                if "message" not in last_await_payload:
+                    last_await_payload["message"] = result
+                if ws_callback:
+                    payload = {
+                        "type": "response",
+                        "payload": {
+                            "text": result,
+                            "display": "card",
+                            "await_input": True,
+                            "app": context.active_app.lower() if context.active_app else "",
+                        },
+                    }
+                    if temp_step.modal_data:
+                        payload["payload"]["modal_data"] = temp_step.modal_data
+                    await ws_callback(payload)
+
+            if success and tool != "await_reply":
+                milestone_step_result_idx += 1
+                milestone_step_results[milestone_step_result_idx] = result
+
+            # Track UI-mutating tools for passive visual injection
+            from agent.verifier import _UI_MUTATING_TOOLS
+            last_tool_was_ui_mutating = tool in _UI_MUTATING_TOOLS
+
+            return (result, success)
+
+        # ── Bridge: wraps executor.execute_milestone() for SubAgentManager ──
+        # SubAgentManager calls this per milestone; it must capture all closure
+        # state (provider, ws_callback, etc.) and return (success, result_summary).
+
+        class _AwaitReplySignal(Exception):
+            """Sentinel raised when a milestone suspends via await_reply."""
+            def __init__(self, suspended_milestone_id: int, await_payload: dict,
+                         await_data: dict):
+                self.suspended_milestone_id = suspended_milestone_id
+                self.await_payload = await_payload
+                self.await_data = await_data
+
+        async def milestone_execute_fn(
+            milestone,
+            current_deliverables: dict,
+        ) -> tuple:
+            nonlocal milestone_step_result_idx, last_await_payload
+
+            plan.mark_milestone_in_progress(milestone.id)
+
+            if ws_callback:
+                total_m = len(plan.milestones)
+                progress_idx = next(
+                    (i + 1 for i, m in enumerate(plan.milestones) if m.id == milestone.id),
+                    milestone.id,
+                )
+                await ws_callback({
+                    "type": "doing",
+                    "text": f"Milestone {progress_idx}/{total_m}: {milestone.goal}",
+                    "tool": "milestone",
+                })
+
+            success, result_summary = await executor.execute_milestone(
+                milestone=milestone,
+                plan=plan,
+                env_perceiver=milestone_env_perceiver,
+                tool_executor=tool_executor,
+                deliverables=current_deliverables,
+                skill_context=getattr(plan, "skill_context", ""),
+                request_scope_tool_names=request_scope_tool_names,
+                blocked_await_signatures=blocked_await_signatures,
+                ws_callback=ws_callback,
+            )
+
+            # Detect await_reply suspension — raise a sentinel so the outer
+            # method can store PendingExecutionState and return to the caller.
+            if not success and result_summary.startswith("AWAIT_REPLY:"):
+                try:
+                    await_data = json.loads(result_summary[len("AWAIT_REPLY:"):])
+                except (json.JSONDecodeError, TypeError):
+                    await_data = {}
+                if await_data.get("signature"):
+                    blocked_await_signatures.add(str(await_data["signature"]))
+                await_payload = dict(last_await_payload or {})
+                if "message" not in await_payload:
+                    await_payload["message"] = str(
+                        await_data.get("message") or "I need more information."
+                    )
+                raise _AwaitReplySignal(
+                    suspended_milestone_id=milestone.id,
+                    await_payload=await_payload,
+                    await_data=await_data,
+                )
+
+            return success, result_summary
+
+        # ── Execute milestones via SubAgentManager (parallel where possible) ──
+        from multi_agent.sub_agent_manager import SubAgentManager
+
+        sub_manager = SubAgentManager(
+            provider=provider,
+            tool_declarations=llm_tool_declarations or tool_registry.declarations(),
+            system_prompt="",
+            ws_callback=ws_callback,
+        )
+
+        try:
+            deliverables = await sub_manager.dispatch(
+                plan=plan,
+                existing_deliverables=deliverables,
+                execute_fn=milestone_execute_fn,
+                replan_fn=self.planner.replan_remaining if (self.planner and not is_research) else None,
+            )
+        except _AwaitReplySignal as sig:
+            # A milestone requested a reply from the user — suspend execution.
+            self._pending_execution = PendingExecutionState(
+                execution_id=uuid.uuid4().hex[:10],
+                plan=plan,
+                created_at=_time.time(),
+                provider=provider,
+                original_user_request=(
+                    pending_execution.original_user_request
+                    if pending_execution is not None
+                    else user_text
+                ),
+                selected_tools=[
+                    str(decl.get("name", "")).strip()
+                    for decl in (llm_tool_declarations or [])
+                    if str(decl.get("name", "")).strip()
+                ],
+                deliverables=dict(deliverables),
+                milestone_step_results=dict(milestone_step_results),
+                milestone_step_result_idx=milestone_step_result_idx,
+                suspended_milestone_id=sig.suspended_milestone_id,
+                await_payload=sig.await_payload,
+                followup_inputs=list(followup_inputs),
+                blocked_await_signatures=sorted(blocked_await_signatures),
+                last_opened_url=self._last_opened_url,
+            )
+            await_message = str(
+                sig.await_payload.get("message") or "I need more information."
+            )
+            self.conversation.add_model(await_message)
+            return await_message, True
+
+        elapsed = _time.time() - t_start
+
+        # ── Execution Summary ──
+        completed = [m for m in plan.milestones if m.status == MilestoneStatus.COMPLETED]
+        failed = [m for m in plan.milestones if m.status == MilestoneStatus.FAILED]
+        skipped = [m for m in plan.milestones if m.status == MilestoneStatus.SKIPPED]
+
+        print(f"\n[AgentV2] ═══ Milestone Execution Summary ═══")
+        print(f"[AgentV2]   Total: {len(plan.milestones)} | "
+              f"Completed: {len(completed)} | Failed: {len(failed)} | Skipped: {len(skipped)}")
+        print(f"[AgentV2]   Duration: {elapsed:.2f}s")
+        print(f"[AgentV2]   Progress: {plan.progress_percentage():.0f}%")
+        for m in plan.milestones:
+            icon = {
+                "COMPLETED": "✓", "FAILED": "✗", "SKIPPED": "⏭",
+                "PENDING": "◻", "IN_PROGRESS": "▶",
+            }.get(m.status.name, "?")
+            hint = f" → {m.result_summary[:80]}" if m.result_summary else ""
+            print(f"[AgentV2]   {icon} [{m.id}] {m.goal}{hint}")
+        print(f"[AgentV2] ═══{'═' * 50}═══\n")
+
+        # ── Build final response ──
+        if plan.is_complete():
+            final_response = plan.final_response or "Done!"
+            if deliverables and not plan.final_response:
+                last_deliv = list(deliverables.values())[-1]
+                if last_deliv and len(last_deliv) > 10:
+                    final_response = last_deliv
+        elif plan.has_failed():
+            failed_goals = [m.goal for m in failed]
+            final_response = f"Sorry, I couldn't complete: {', '.join(failed_goals[:3])}"
+        else:
+            final_response = f"Partially completed ({len(completed)}/{len(plan.milestones)} milestones)."
+
+        # ── Send final response ──
+        try:
+            await tool_registry.execute("send_response", {"message": final_response})
+        except StopAsyncIteration:
+            pass
+        except Exception as e:
+            print(f"[AgentV2] send_response error: {e}")
+
+        if ws_callback and final_response:
+            display_text = final_response.replace("[CONVERSATION_MODE_ON]", "").replace("[CONVERSATION_MODE_OFF]", "")
+            display = "pill" if len(display_text) <= 40 else "card"
+            payload = {
+                "text": display_text,
+                "display": display,
+                "app": context.active_app.lower() if context.active_app else "",
+            }
+            if getattr(self, "_last_modal_data", None):
+                payload["modal_data"] = self._last_modal_data
+                if "message" not in payload["modal_data"]:
+                    payload["modal_data"]["message"] = display_text
+            await ws_callback({
+                "type": "response",
+                "payload": payload,
+            })
+
+        self.conversation.add_model(final_response)
+
+        # Log research summary
+        research_summary = self.working_memory.get_research_summary()
+        if research_summary:
+            print(f"\n[AgentV2] ═══ Research Summary ═══")
+            print(research_summary)
+            print(f"[AgentV2] ═══ End Research Summary ═══\n")
+
+        return (final_response, False)
+
+    def _looks_like_research_doc_task(self, user_text: str, task_summary: str) -> bool:
+        text = f"{user_text or ''} {task_summary or ''}".lower()
+        research_terms = ("research", "investigate", "analyze", "analyse", "compare", "study", "find", "look up", "best")
+        doc_terms = ("document", "report", "write up", "write-up", "brief", "summary", "paper", "article")
+        return any(term in text for term in research_terms) and any(term in text for term in doc_terms)
+
+    def _build_research_stream_lines(self, content_text: str, max_lines: int = 3) -> list[str]:
+        lines: list[str] = []
+        for raw_line in str(content_text or "").splitlines():
+            compact = " ".join(raw_line.split())
+            if not compact:
+                continue
+            while compact and len(lines) < max_lines:
+                if len(compact) <= 220:
+                    lines.append(compact)
+                    compact = ""
+                    break
+                split_at = compact.rfind(" ", 0, 220)
+                if split_at < 80:
+                    split_at = 220
+                lines.append(compact[:split_at].rstrip())
+                compact = compact[split_at:].lstrip()
+            if len(lines) >= max_lines:
+                break
+
+        if not lines:
+            compact = " ".join(str(content_text or "").split())
+            if compact:
+                lines.append(compact[:220])
+        return lines[:max_lines]
+
+    def _emit_research_stream(
+        self,
+        step: ExecutionStep,
+        source_url: str,
+        source_title: str,
+        content_text: str,
+        element_count: int,
+    ) -> None:
+        print(
+            f"[ResearchStream] tool={step.tool} "
+            f"source={source_url or 'current page'} "
+            f"items={int(element_count or 0)}"
+        )
+        if source_title:
+            print(f"[ResearchStream] title={source_title}")
+        for idx, line in enumerate(self._build_research_stream_lines(content_text), 1):
+            print(f"[ResearchStream] snippet[{idx}] {line}")
+
+    def _log_research_content(
+        self,
+        step: ExecutionStep,
+        result: str,
+        is_research: bool,
+        *,
+        emit_stream: bool = True,
+        commit_to_memory: bool = True,
+    ) -> None:
+        """Log detailed research content from browser_read_page and similar tools."""
+        if not result:
+            return
+        raw_result = str(result).strip()
+        if raw_result.startswith("Opened http") or raw_result.startswith("Opened web search"):
+            return
+
+        source_url = ""
+        source_title = ""
+        content_text = ""
+        element_count = 0
+
+        try:
+            data = json.loads(result)
+            if isinstance(data, dict):
+                source_url = data.get("url", "")
+                source_title = data.get("title", "")
+                element_count = data.get("element_count", 0) or data.get("item_count", 0) or data.get("paragraph_count", 0)
+                target_type = str(data.get("target_type", "")).strip().lower()
+                content_text = data.get("content", "")
+
+                # For fetch_web_content results
+                if not content_text:
+                    content_text = data.get("text", data.get("summary", ""))
+
+                # For structured extraction tools
+                if isinstance(data.get("items"), list) and (
+                    not content_text or target_type in {"search_results", "structured_data"}
+                ):
+                    preview_rows: list[str] = []
+                    for item in data.get("items", [])[:8]:
+                        if not isinstance(item, dict):
+                            continue
+                        label = str(item.get("label", "")).strip()
+                        href = str(item.get("href", "")).strip()
+                        context = str(item.get("context", "")).strip()
+                        row = " | ".join(part for part in (label, context, href) if part)
+                        if row:
+                            preview_rows.append(row[:220])
+                    if preview_rows:
+                        content_text = "\n".join(preview_rows)
+
+                # For page-summary tools
+                if not content_text and isinstance(data.get("headings"), list):
+                    heading_lines = []
+                    for h in data.get("headings", [])[:6]:
+                        if isinstance(h, dict):
+                            text = str(h.get("text", "")).strip()
+                            if text:
+                                heading_lines.append(text[:140])
+                    if heading_lines:
+                        page_type = str(data.get("page_type", "unknown")).strip()
+                        content_text = f"Page type: {page_type}\n" + "\n".join(heading_lines)
+        except (json.JSONDecodeError, TypeError):
+            content_text = result[:500] if len(result) >= 60 else ""
+
+        # Log what the agent is reading
+        if content_text:
+            preview = content_text[:300].replace("\n", " ↵ ")
+            if emit_stream:
+                print(f"[AgentV2] 📖 READING from: {source_url or 'current page'}")
+                print(f"[AgentV2] 📖 Page title: {source_title or '(untitled)'}")
+                print(f"[AgentV2] 📖 Elements read: {element_count}")
+                print(f"[AgentV2] 📖 Content preview: {preview}{'...' if len(content_text) > 300 else ''}")
+                print(f"[AgentV2] 📖 Content length: {len(content_text)} chars")
+                self._emit_research_stream(step, source_url, source_title, content_text, element_count)
+
+            # Store as research snippet in working memory (with quality filtering)
+            if commit_to_memory and (is_research or len(content_text) >= 100):
+                # Skip search engine homepages and browser navigation chrome
+                _src_domain = self._domain_key(source_url)
+                _junk_domains = {"google.com", "bing.com", "duckduckgo.com", "yahoo.com", "baidu.com"}
+                _is_search_page = (
+                    _src_domain in _junk_domains
+                    or "/webhp" in source_url
+                    or "/search?" in source_url
+                    or source_url.rstrip("/").endswith(("google.com", "bing.com"))
+                )
+                _is_chrome_content = content_text.count("[mw_") > 3
+
+                if _is_search_page or _is_chrome_content:
+                    print(f"[AgentV2] 📖 Skipping non-research content from {_src_domain or 'unknown'}")
+                    reason = "search_page" if _is_search_page else "browser_chrome"
+                    print(f"[ResearchStream] stored=false reason={reason}")
+                else:
+                    before_count = len(self.working_memory.get_research_snippets())
+                    self.working_memory.log_research_snippet(
+                        source=source_url,
+                        title=source_title,
+                        content=content_text,
+                        tool=step.tool,
+                    )
+                    snippet_count = len(self.working_memory.get_research_snippets())
+                    if snippet_count > before_count:
+                        print(f"[AgentV2] 📚 Research stored: {snippet_count} snippet(s) total")
+                        print(f"[ResearchStream] stored=true snippets={snippet_count}")
+                    else:
+                        print(f"[AgentV2] 📚 Research store skipped by working-memory filter")
+                        print(f"[ResearchStream] stored=false reason=memory_filter")
+        elif emit_stream:
+            print(f"[AgentV2] 📖 Page read returned no extractable content (url={source_url})")
+            print(f"[ResearchStream] tool={step.tool} empty=true source={source_url or 'current page'}")
+
+    def _extract_research_text(self, tool_result: str) -> str:
+        if not tool_result:
+            return ""
+        raw = str(tool_result).strip()
+        if not raw or raw.startswith("ERROR"):
+            return ""
+        if raw.startswith("Opened http"):
+            return ""
+
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                target_type = str(data.get("target_type", "")).strip().lower()
+                source_url = str(data.get("url", "")).strip()
+                if target_type == "search_results":
+                    return ""
+                if source_url and (
+                    self._domain_key(source_url) in {"google.com", "bing.com", "duckduckgo.com", "yahoo.com"}
+                    or "/search?" in source_url
+                ):
+                    return ""
+                if isinstance(data.get("content"), str) and data["content"].strip():
+                    prefix = []
+                    if data.get("title"):
+                        prefix.append(f"Title: {data['title']}")
+                    if data.get("url"):
+                        prefix.append(f"URL: {data['url']}")
+                    prefix_text = "\n".join(prefix)
+                    return (prefix_text + "\n" + data["content"]).strip()
+
+                items = data.get("items")
+                if isinstance(items, list) and items:
+                    lines = []
+                    if data.get("title"):
+                        lines.append(f"Title: {data.get('title')}")
+                    if data.get("url"):
+                        lines.append(f"URL: {data.get('url')}")
+                    for item in items[:10]:
+                        if not isinstance(item, dict):
+                            continue
+                        label = str(item.get("label", "")).strip()
+                        context = str(item.get("context", "")).strip()
+                        href = str(item.get("href", "")).strip()
+                        row = " | ".join(part for part in (label, context, href) if part)
+                        if row:
+                            lines.append(f"- {row[:240]}")
+                    if len(lines) > 2:
+                        return "\n".join(lines)
+
+                for key in ("text", "summary", "message"):
+                    value = data.get(key)
+                    if isinstance(value, str) and len(value.strip()) >= 40:
+                        return value.strip()
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        return raw if len(raw) >= 60 else ""
+
+    def _collect_research_snippets(self, step_results: dict) -> list[str]:
+        snippets: list[str] = []
+        seen_source_keys: set[str] = set()
+        seen_content_keys: set[str] = set()
+
+        def _remember(snippet_text: str, source_key: str = "") -> bool:
+            normalized = " ".join(str(snippet_text or "").split()).lower()[:800]
+            if not normalized:
+                return False
+            if source_key and source_key in seen_source_keys:
+                return False
+            if normalized in seen_content_keys:
+                return False
+            if source_key:
+                seen_source_keys.add(source_key)
+            seen_content_keys.add(normalized)
+            return True
+
+        # First, collect from working memory (more structured, with source info)
+        wm_snippets = self.working_memory.get_research_snippets()
+        for ws in wm_snippets:
+            content = ws.get("content", "")
+            source = ws.get("source", "")
+            title = ws.get("title", "")
+            if not content or len(content.strip()) < 40:
+                continue
+            header_parts = []
+            if title:
+                header_parts.append(f"Title: {title}")
+            if source:
+                header_parts.append(f"URL: {source}")
+            header = "\n".join(header_parts)
+            snippet = (header + "\n" + content).strip()[:3200]
+            source_key = source.strip().rstrip("/").lower()
+            if _remember(snippet, source_key=source_key):
+                snippets.append(snippet)
+            if len(snippets) >= 6:
+                break
+
+        # Supplement from step_results if needed
+        if len(snippets) < 4:
+            for _, result in sorted(step_results.items(), key=lambda item: item[0]):
+                raw_result = str(result)
+                snippet = self._extract_research_text(raw_result)
+                if not snippet:
+                    continue
+                source_key = ""
+                try:
+                    data = json.loads(raw_result)
+                    if isinstance(data, dict):
+                        source_key = str(data.get("url", "")).strip().rstrip("/").lower()
+                except (json.JSONDecodeError, TypeError):
+                    source_key = ""
+                snippet = snippet[:3200]
+                if _remember(snippet, source_key=source_key):
+                    snippets.append(snippet)
+                if len(snippets) >= 6:
+                    break
+
+        if snippets:
+            print(f"[AgentV2] 📚 Collected {len(snippets)} research snippet(s) for document synthesis")
+
+        return snippets
+
+    async def _synthesize_research_body(
+        self,
+        provider: LLMProvider,
+        user_text: str,
+        task_summary: str,
+        snippets: list[str],
+    ) -> str:
+        snippet_text = "\n\n".join(
+            f"[Snippet {idx + 1}]\n{snippet}" for idx, snippet in enumerate(snippets)
+        )
+        prompt = (
+            "Write a complete, factual document from the research snippets.\n"
+            f"Task: {user_text or task_summary}\n\n"
+            "Requirements:\n"
+            "- Use clear section headings.\n"
+            "- Cover major system categories, how they work, and key tradeoffs.\n"
+            "- Keep claims grounded in the snippets.\n"
+            "- Return only the document text (markdown allowed).\n\n"
+            f"{snippet_text}"
+        )
+        response = await provider.generate(
+            messages=[{"role": "user", "parts": [{"text": prompt}]}],
+            system_prompt="You are an expert policy and housing analyst. Produce concise, accurate prose.",
+            tools=[],
+            temperature=0.2,
+        )
+        text = (response.text or "").strip() if response else ""
+        if text.startswith("```"):
+            text = text.strip("`")
+        return text[:14000]
+
+    def _remember_opened_url(self, step: ExecutionStep, result: str) -> None:
+        if step.tool == "open_url":
+            candidate = str(step.args.get("url") or "").strip()
+            if not candidate:
+                import re
+                match = re.search(r"https?://[^\s\"']+", str(result))
+                if match:
+                    candidate = match.group(0).rstrip(".,)")
+            if candidate:
+                self._last_opened_url = candidate
+        elif step.tool == "web_search":
+            # web_search opens a Google search URL — track it so the
+            # browser_read_page recovery can detect tab mismatches.
+            query = str(step.args.get("query", "")).strip()
+            if query:
+                from urllib.parse import quote_plus
+                self._last_opened_url = f"https://www.google.com/search?q={quote_plus(query)}"
+
+    def _domain_key(self, url: str) -> str:
+        if not url:
+            return ""
+        try:
+            host = (urlparse(url).netloc or "").lower()
+        except Exception:
+            return ""
+        if host.startswith("www."):
+            host = host[4:]
+        return host
+
+    async def _recover_browser_context(self, step: ExecutionStep, result: str) -> str:
+        browser_read_tools = {
+            "browser_read_page",
+            "browser_read_text",
+            "read_page_content",
+            "extract_structured_data",
+            "get_page_summary",
+        }
+        if step.tool not in browser_read_tools or not self._last_opened_url:
+            return result
+
+        expected_url = self._last_opened_url
+
+        try:
+            payload = json.loads(result)
+        except (TypeError, json.JSONDecodeError):
+            return result
+        if not isinstance(payload, dict):
+            return result
+        observed_url = str(payload.get("url") or "").strip()
+        if not observed_url:
+            return result
+
+        expected_domain = self._domain_key(expected_url)
+        observed_domain = self._domain_key(observed_url)
+        if expected_domain and observed_domain and expected_domain == observed_domain:
+            return result
+
+        print(
+            f"[AgentV2] {step.tool} context drift detected "
+            f"(expected {expected_domain or expected_url}, got {observed_domain or observed_url}); retrying."
+        )
+        switched = False
+        for switch_target in (expected_url, expected_domain):
+            if not switch_target:
+                continue
+            try:
+                switch_result = await tool_registry.execute("browser_switch_tab", {"url": switch_target})
+                try:
+                    switch_payload = json.loads(switch_result)
+                    switched = bool(switch_payload.get("ok"))
+                except (TypeError, json.JSONDecodeError):
+                    switched = "switched" in str(switch_result).lower()
+            except Exception as e:
+                print(f"[AgentV2] browser_switch_tab recovery failed: {e}")
+                switched = False
+            if switched:
+                break
+
+        if not switched:
+            return result
+
+        try:
+            await tool_registry.execute("browser_refresh_refs", {})
+        except Exception as e:
+            print(f"[AgentV2] browser_refresh_refs during recovery failed: {e}")
+
+        retry_args = dict(step.args)
+        if step.tool in ("browser_read_page", "browser_read_text"):
+            retry_args["refresh"] = True
+        try:
+            retry_result = await tool_registry.execute(step.tool, retry_args)
+        except Exception as e:
+            print(f"[AgentV2] {step.tool} recovery retry failed: {e}")
+            return result
+
+        return retry_result
+
+    async def _execute_step(
+        self,
+        step: ExecutionStep,
+        world_state: WorldState,
+        ws_callback: Optional[WSCallback],
+        user_text: str = "",
+        task_summary: str = "",
+    ) -> bool:
+        """
+        Execute a single step and verify the result.
+        
+        Returns:
+            True if step succeeded, False if failed
+        """
+        t_start = _time.time()
+        print(f"[AgentV2] ┌─ EXECUTE: {step.tool}")
+        print(f"[AgentV2] │  Args: {json.dumps(step.args, ensure_ascii=False)[:300]}")
+        
+        try:
+            gateway_context = self._current_tool_gateway_context()
+            set_tool_gateway_context(
+                active_app=world_state.active_app,
+                browser_url=self._last_opened_url or world_state.browser_url or "",
+                background_mode=False,
+                browser_bridge_connected=gateway_context["browser_bridge_connected"],
+                browser_has_snapshot=gateway_context["browser_has_snapshot"],
+                browser_session_id=gateway_context["browser_session_id"],
+            )
+            browser_read_tools = {
+                "browser_read_page",
+                "browser_read_text",
+                "read_page_content",
+                "extract_structured_data",
+                "get_page_summary",
+            }
+            # Before browser reads: verify snapshot matches real browser URL
+            if step.tool in browser_read_tools and not step.args.get("refresh"):
+                try:
+                    _rd_app = await perception.get_active_app()
+                    if _rd_app.lower() in perception.BROWSERS:
+                        _rd_url = await perception.get_browser_url(_rd_app)
+                        if _rd_url:
+                            from browser.store import browser_store as _bstore
+                            _snap = _bstore.get_snapshot()
+                            if _snap and self._domain_key(_rd_url) != self._domain_key(_snap.url or ""):
+                                if step.tool in ("browser_read_page", "browser_read_text"):
+                                    step.args["refresh"] = True
+                                else:
+                                    await tool_registry.execute("browser_refresh_refs", {})
+                                print(f"[AgentV2] 🔄 Auto-refresh: browser={self._domain_key(_rd_url)}, "
+                                      f"snapshot={self._domain_key(_snap.url or '')}")
+                except Exception:
+                    pass
+
+            # Execute the tool
+            result = await tool_registry.execute(step.tool, step.args)
+            elapsed = _time.time() - t_start
+            self._remember_opened_url(step, result)
+
+            print(f"[AgentV2] │  Duration: {elapsed:.2f}s")
+
+            # After web_search: wait for the browser tab to switch and force a
+            # snapshot refresh so the next browser_read_page reads the search
+            # results instead of whatever tab was previously active.
+            if step.tool == "web_search":
+                await asyncio.sleep(BROWSER_NAV_SETTLE_S)
+                try:
+                    await tool_registry.execute("browser_refresh_refs", {})
+                except Exception:
+                    pass  # Non-critical
+
+            # After click navigation: wait for page to load and refresh snapshot
+            # so the next read step sees the new page, not stale pre-click data.
+            should_refresh_after_nav = step.tool in ("browser_click_match", "browser_click_ref", "open_url")
+            if step.tool == "find_and_act" and str(step.args.get("action", "")).lower() == "click":
+                should_refresh_after_nav = True
+            if should_refresh_after_nav:
+                await asyncio.sleep(BROWSER_NAV_SETTLE_S)
+                try:
+                    await tool_registry.execute("browser_refresh_refs", {})
+                except Exception:
+                    pass
+                # Update tracked URL to the REAL browser URL after navigation.
+                # This prevents drift detection from trying to navigate BACK to
+                # the previous page (e.g. Google search results).
+                try:
+                    _nav_app = await perception.get_active_app()
+                    if _nav_app.lower() in perception.BROWSERS:
+                        _nav_url = await perception.get_browser_url(_nav_app)
+                        if _nav_url:
+                            self._last_opened_url = _nav_url
+                except Exception:
+                    pass
+
+            result = await self._recover_browser_context(step, result)
+            
+            # Log tool output (truncated for readability)
+            result_preview = result[:200].replace("\n", " ↵ ") if result else "(empty)"
+            print(f"[AgentV2] │  Output: {result_preview}{'…' if len(result) > 200 else ''}")
+            print(f"[AgentV2] │  Output length: {len(result)} chars")
+
+            # ── Research logging & content extraction ──
+            is_research = self._looks_like_research_doc_task(user_text, task_summary)
+            research_content_tools = {
+                "browser_read_page",
+                "browser_read_text",
+                "fetch_web_content",
+                "web_scrape",
+                "get_web_information",
+                "gworkspace_analyze",
+                "gdocs_read",
+                "read_page_content",
+                "extract_structured_data",
+                "get_page_summary",
+            }
+            if step.tool in research_content_tools:
+                self._log_research_content(
+                    step,
+                    result,
+                    is_research,
+                    emit_stream=True,
+                    commit_to_memory=False,
+                )
+            elif step.tool == "web_search" and is_research:
+                query = step.args.get("query", "")
+                print(f"[AgentV2] 🔍 RESEARCH SEARCH: '{query}'")
+            elif step.tool == "browser_click_match" and is_research:
+                query = step.args.get("query", "")
+                print(f"[AgentV2] 🖱️ NAVIGATING to source: clicking '{query}'")
+            elif step.tool == "browser_scroll" and is_research:
+                direction = step.args.get("direction", "down")
+                print(f"[AgentV2] 📜 SCROLLING {direction} for more research content")
+            
+            # Handle special response tools
+            if step.tool == "send_response" and result.startswith("RESPONSE:"):
+                raw = result[len("RESPONSE:"):]
+                try:
+                    modal_data = json.loads(raw)
+                    step.result = modal_data.get("message", raw)
+                    step.modal_data = modal_data  # structured modal payload
+                except (json.JSONDecodeError, TypeError):
+                    step.result = raw
+                    step.modal_data = None
+                step.status = StepStatus.COMPLETED
+                return True
+            
+            if step.tool == "await_reply" and result.startswith("AWAIT:"):
+                raw = result[len("AWAIT:"):]
+                try:
+                    modal_data = json.loads(raw)
+                    step.result = modal_data.get("message", raw)
+                    step.modal_data = modal_data
+                except (json.JSONDecodeError, TypeError):
+                    step.result = raw
+                    step.modal_data = None
+                step.status = StepStatus.COMPLETED
+                return True
+            
+            # Verify the result (visual verification for UI-mutating tools)
+            verification = await self.verifier.verify_with_visual(
+                tool_name=step.tool,
+                tool_args=step.args,
+                tool_result=result,
+                success_criteria=step.success_criteria,
+                get_current_state=self._get_quick_state,
+                get_visual_state=self._get_visual_state,
+            )
+            
+            print(f"[AgentV2] │  Verification: success={verification.success}, "
+                  f"confidence={verification.confidence:.0%}, msg={verification.message}")
+
+            verification_success = verification.success
+            if verification.confidence < 0.5:
+                verification_success = False
+                if not verification.should_retry:
+                    verification.should_retry = True
+                verification.message = (
+                    f"Verification confidence too low ({verification.confidence:.0%}): "
+                    f"{verification.message}"
+                )
+
+            if verification_success:
+                if step.tool in research_content_tools:
+                    self._log_research_content(
+                        step,
+                        result,
+                        is_research,
+                        emit_stream=False,
+                        commit_to_memory=True,
+                    )
+                if step.tool not in ("send_response", "await_reply"):
+                    self.working_memory.log_action(
+                        tool=step.tool,
+                        args=step.args,
+                        result=result,
+                        success=True,
+                    )
+                step.status = StepStatus.COMPLETED
+                step.result = result
+                total_elapsed = _time.time() - t_start
+                print(f"[AgentV2] └─ ✓ Step {step.id} COMPLETED ({total_elapsed:.2f}s)")
+                return True
+            
+            # Verification failed - try retry or fallback
+            if verification.should_retry and step.retries < step.max_retries:
+                print(f"[AgentV2] │  ↻ Retrying step {step.id} (attempt {step.retries + 1}/{step.max_retries})…")
+                step.retries += 1
+                step.status = StepStatus.PENDING  # Reset for retry
+                return await self._execute_step(step, world_state, ws_callback, user_text=user_text, task_summary=task_summary)
+            
+            # Try fallback tool if available
+            if step.fallback_tool:
+                print(f"[AgentV2] │  Trying fallback tool: {step.fallback_tool}")
+                fallback_result = await tool_registry.execute(
+                    step.fallback_tool, 
+                    step.fallback_args or step.args
+                )
+                
+                fallback_verify = await self.verifier.verify(
+                    tool_name=step.fallback_tool,
+                    tool_args=step.fallback_args or step.args,
+                    tool_result=fallback_result,
+                    success_criteria=step.success_criteria
+                )
+                
+                if fallback_verify.success:
+                    step.status = StepStatus.COMPLETED
+                    step.result = fallback_result
+                    return True
+            
+            # Step failed
+            step.status = StepStatus.FAILED
+            step.error = verification.message
+            if step.tool not in ("send_response", "await_reply"):
+                self.working_memory.log_action(
+                    tool=step.tool, args=step.args,
+                    result=verification.message, success=False,
+                )
+            print(f"[AgentV2] └─ ✗ Step {step.id} FAILED: {verification.message}")
+            return False
+            
+        except StopAsyncIteration:
+            # send_response in benchmark mode raises this - treat as success
+            step.status = StepStatus.COMPLETED
+            step.result = str(step.args.get("message") or step.args.get("response_text", "Done"))
+            print(f"[AgentV2] └─ ✓ Step {step.id} COMPLETED (benchmark mode)")
+            return True
+        except Exception as e:
+            print(f"[AgentV2] └─ ✗ Step {step.id} EXCEPTION: {e}")
+            step.status = StepStatus.FAILED
+            step.error = str(e)
+            if step.tool not in ("send_response", "await_reply"):
+                self.working_memory.log_action(
+                    tool=step.tool, args=step.args,
+                    result=str(e), success=False,
+                )
+            return False
+
+    async def _get_quick_state(self) -> dict:
+        """Get quick state for verification (minimal perception)."""
+        try:
+            active_app, window_title, clipboard = await asyncio.gather(
+                perception.get_active_app(),
+                perception.get_window_title(),
+                perception.get_clipboard(),
+            )
+            browser_url = None
+            if active_app.lower() in perception.BROWSERS:
+                browser_url = await perception.get_browser_url(active_app)
+            
+            return {
+                "active_app": active_app,
+                "window_title": window_title,
+                "browser_url": browser_url,
+                "clipboard": (clipboard or "")[:500],
+                "last_typed_text": self.working_memory.get_last_typed_text()[:500],
+            }
+        except Exception:
+            return {}
+
+    async def _get_visual_state(self) -> str:
+        """Get DOM snapshot + screenshot summary for visual verification."""
+        parts: list[str] = []
+        try:
+            from browser.store import browser_store
+            snap = browser_store.get_snapshot()
+            if snap and snap.elements:
+                dom_lines = [f"Page: {snap.title} ({snap.url})"]
+                for el in snap.elements[:30]:
+                    label = el.primary_label()[:60] if el.primary_label() else el.tag
+                    dom_lines.append(f"  [{el.ref_id}] {el.role or el.tag}: {label}")
+                parts.append("\n".join(dom_lines))
+        except Exception:
+            pass
+
+        try:
+            screenshot_path = await perception.capture_screenshot()
+            if screenshot_path:
+                parts.append(f"Screenshot: {screenshot_path}")
+        except Exception:
+            pass
+
+        return "\n".join(parts) if parts else ""
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Factory Function
+# ═══════════════════════════════════════════════════════════════
+
+def create_agent(version: str = "v2", use_planning: bool = True, persist: bool = True):
+    """
+    Create the active Moonwalk agent runtime.
+    
+    Args:
+        version: Deprecated compatibility argument. V2 is always used.
+        use_planning: For V2, whether to use LLM planning (slower but smarter)
+        persist: If True, persist conversation sessions to disk.
+                Set False for benchmarks / tests.
+        
+    Returns:
+        MoonwalkAgentV2 instance
+    """
+    if str(version or "v2").lower() != "v2":
+        print(f"[AgentV2] Ignoring deprecated agent version '{version}' and using V2.")
+    return MoonwalkAgentV2(use_planning=use_planning, persist=persist)

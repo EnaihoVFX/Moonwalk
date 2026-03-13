@@ -14,13 +14,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY backend/requirements-cloud.txt .
 RUN pip install --no-cache-dir -r requirements-cloud.txt
 
-# Copy only the cloud-relevant source files
-COPY backend/cloud_server.py .
-COPY backend/agent.py .
-COPY backend/providers.py .
-COPY backend/model_router.py .
-COPY backend/memory.py .
-COPY backend/tools.py .
+# Copy the modular backend packages
+COPY backend/__init__.py .
+COPY backend/agent/ agent/
+COPY backend/providers/ providers/
+COPY backend/tools/ tools/
+COPY backend/multi_agent/ multi_agent/
+COPY backend/servers/cloud_server.py .
 COPY backend/.env .
 
 # Cloud Run uses PORT env var (default 8080)

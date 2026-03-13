@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "electron": "^36.2.0",
+    "katex": "^0.16.37",
     "ws": "^8.19.0"
   }
 }

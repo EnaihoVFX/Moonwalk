@@ -1,5 +1,6 @@
 const path = require("node:path");
 const fs = require("node:fs");
+const net = require("node:net");
 const { spawn } = require("node:child_process");
 const {
   app,
@@ -19,18 +20,65 @@ const HOTKEYS = (process.env.LIQUID_HOTKEY || "CommandOrControl+Shift+Space,Alt+
 const WINDOW_LEVEL = "screen-saver";
 
 let mainWindow;
-let dashboardWindow = null;
 let lastWakeAt = 0;
 let pythonProcess = null;
+let ownsPythonProcess = false;
 
-function startPythonBackend() {
+const BACKEND_WS_URL = process.env.MOONWALK_BACKEND_WS_URL || "ws://127.0.0.1:8000/ws";
+const BACKEND_HOST = process.env.MOONWALK_BACKEND_HOST || "127.0.0.1";
+const BACKEND_PORT = Number(process.env.MOONWALK_BACKEND_PORT || "8000");
+const BRIDGE_PORT = Number(process.env.MOONWALK_BROWSER_BRIDGE_PORT || "8765");
+const BACKEND_READY_SENTINEL = "[Backend] READY";
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function canReachPort(port, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const socket = net.createConnection({ host: BACKEND_HOST, port });
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        socket.destroy();
+      } catch {
+      }
+      resolve(result);
+    };
+
+    const timer = setTimeout(() => finish(false), timeoutMs);
+
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+  });
+}
+
+async function canReachBackend(timeoutMs = 1500) {
+  const [backendReady, bridgeReady] = await Promise.all([
+    canReachPort(BACKEND_PORT, timeoutMs),
+    canReachPort(BRIDGE_PORT, timeoutMs)
+  ]);
+  return backendReady && bridgeReady;
+}
+
+async function startPythonBackend() {
   const venvPythonPath = path.join(__dirname, "venv", "bin", "python3");
-  const scriptPath = path.join(__dirname, "backend", "backend_server.py");
+  const scriptPath = path.join(__dirname, "backend", "servers", "local_server.py");
 
   if (!fs.existsSync(venvPythonPath)) {
     console.error(`[Backend] Python executable not found at: ${venvPythonPath}`);
     console.error("[Backend] Please ensure you have run: python3 -m venv venv");
-    return;
+    return false;
+  }
+
+  if (await canReachBackend()) {
+    console.log(`[Backend] Reusing existing backend at ${BACKEND_WS_URL}`);
+    ownsPythonProcess = false;
+    return true;
   }
 
   console.log("[Backend] Starting Python server...");
@@ -40,27 +88,71 @@ function startPythonBackend() {
     cwd: __dirname,
     stdio: ['ignore', 'pipe', 'pipe']
   });
+  ownsPythonProcess = true;
+
+  let sawAddressInUse = false;
+  let readinessBuffer = "";
+  let resolveReady;
+  const readyPromise = new Promise((resolve) => {
+    resolveReady = resolve;
+  });
 
   // Pipe python stdout/stderr to our electron console
   pythonProcess.stdout.on('data', (data) => {
-    process.stdout.write(`[Python] ${data.toString()}`);
+    const text = data.toString();
+    readinessBuffer = (readinessBuffer + text).slice(-4096);
+    if (readinessBuffer.includes(BACKEND_READY_SENTINEL)) {
+      resolveReady(true);
+    }
+    process.stdout.write(`[Python] ${text}`);
   });
 
   pythonProcess.stderr.on('data', (data) => {
-    process.stderr.write(`[Python ERRROR] ${data.toString()}`);
+    const text = data.toString();
+    if (text.includes("Errno 48") || text.includes("address already in use")) {
+      sawAddressInUse = true;
+    }
+    process.stderr.write(`[Python ERRROR] ${text}`);
   });
 
   pythonProcess.on('close', (code) => {
-    console.log(`[Backend] Python server exited with code ${code}`);
+    resolveReady(false);
+    if (sawAddressInUse) {
+      console.log("[Backend] Python server did not start because port 8000 is already in use.");
+    } else {
+      console.log(`[Backend] Python server exited with code ${code}`);
+    }
     pythonProcess = null;
+    ownsPythonProcess = false;
   });
+
+  const ready = await Promise.race([
+    readyPromise,
+    sleep(10000).then(() => false)
+  ]);
+  if (ready) {
+    return true;
+  }
+
+  if (await canReachBackend()) {
+    return true;
+  }
+
+  if (sawAddressInUse && await canReachBackend()) {
+    console.log(`[Backend] Reusing backend that is already listening at ${BACKEND_WS_URL}`);
+    return true;
+  }
+
+  console.error("[Backend] Backend did not become ready in time.");
+  return false;
 }
 
 function stopPythonBackend() {
-  if (pythonProcess) {
+  if (pythonProcess && ownsPythonProcess) {
     console.log("[Backend] Stopping Python server...");
     pythonProcess.kill('SIGTERM');
     pythonProcess = null;
+    ownsPythonProcess = false;
   }
 }
 
@@ -132,47 +224,6 @@ function hideOverlay() {
   mainWindow.webContents.send("overlay-hidden");
 }
 
-function createDashboardWindow(agentId = null) {
-  if (dashboardWindow && !dashboardWindow.isDestroyed()) {
-    dashboardWindow.focus();
-    return;
-  }
-
-  dashboardWindow = new BrowserWindow({
-    width: 900,
-    height: 600,
-    minWidth: 640,
-    minHeight: 400,
-    show: false,
-    frame: true,
-    titleBarStyle: "hiddenInset",
-    transparent: false,
-    resizable: true,
-    backgroundColor: "#f5f5f7",
-    webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
-      contextIsolation: true,
-      nodeIntegration: false
-    }
-  });
-
-  if (agentId) {
-    dashboardWindow.loadFile(path.join(__dirname, "renderer", "dashboard.html"), {
-      search: `agent=${encodeURIComponent(agentId)}`
-    });
-  } else {
-    dashboardWindow.loadFile(path.join(__dirname, "renderer", "dashboard.html"));
-  }
-
-  dashboardWindow.once("ready-to-show", () => {
-    dashboardWindow.show();
-  });
-
-  dashboardWindow.on("closed", () => {
-    dashboardWindow = null;
-  });
-}
-
 function registerHotkey() {
   globalShortcut.unregisterAll();
   let registeredCount = 0;
@@ -186,16 +237,6 @@ function registerHotkey() {
     } else {
       console.error(`Failed to register global shortcut: ${accelerator}`);
     }
-  }
-
-  // Register dashboard shortcut
-  const dOk = globalShortcut.register("CommandOrControl+Shift+D", () => {
-    createDashboardWindow();
-  });
-  if (dOk) {
-    registeredCount += 1;
-  } else {
-    console.error("Failed to register dashboard shortcut: CommandOrControl+Shift+D");
   }
 
   if (registeredCount === 0) {
@@ -244,7 +285,7 @@ app.whenReady().then(async () => {
   await configureMicrophonePermissions();
 
   // Start backend before creating the window
-  startPythonBackend();
+  await startPythonBackend();
 
   createWindow();
   registerHotkey();
@@ -275,10 +316,6 @@ ipcMain.on("log-error", (event, msg) => {
 
 ipcMain.on("log-info", (event, msg) => {
   console.log(`[Renderer Info] ${msg}`);
-});
-
-ipcMain.on("open-dashboard", (event, agentId) => {
-  createDashboardWindow(agentId);
 });
 
 app.on("will-quit", () => {

@@ -5,6 +5,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Moonwalk</title>
+  <link rel="stylesheet" href="../node_modules/katex/dist/katex.min.css" />
   <link rel="stylesheet" href="./styles.css" />
 </head>
 
@@ -53,94 +54,125 @@
       </div>
     </div>
 
-  </div>
+    <!-- ═══ MODAL: Rich (long-form content) ═══ -->
+    <div class="modal-rich hidden" id="modal-rich">
+      <button class="response-dismiss" id="rich-dismiss" aria-label="Dismiss">
+        <svg width="10" height="10" viewBox="0 0 10 10">
+          <path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+        </svg>
+      </button>
+      <div class="modal-rich-title" id="rich-title"></div>
+      <div class="modal-rich-body" id="rich-body"></div>
+    </div>
 
-  <!-- ═══ RIGHT-EDGE AGENT BUBBLE ═══ -->
-  <div class="agent-bubble" id="agent-bubble" title="Agent Hub">
-    <svg class="agent-bubble-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-      <circle cx="12" cy="8" r="4" />
-      <path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2" />
-    </svg>
-    <div class="agent-bubble-dot hidden" id="agent-dot"></div>
-  </div>
+    <!-- ═══ MODAL: Table (structured data) ═══ -->
+    <div class="modal-table hidden" id="modal-table">
+      <button class="response-dismiss" id="table-dismiss" aria-label="Dismiss">
+        <svg width="10" height="10" viewBox="0 0 10 10">
+          <path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+        </svg>
+      </button>
+      <div class="modal-table-title" id="table-title"></div>
+      <div class="modal-table-wrap">
+        <table class="modal-table-el" id="table-el">
+          <thead id="table-head"></thead>
+          <tbody id="table-body"></tbody>
+        </table>
+      </div>
+      <div class="modal-table-footer" id="table-footer"></div>
+    </div>
 
-  <!-- ═══ TOOLS POPUP (appears beside bubble) ═══ -->
-  <div class="tools-popup hidden" id="tools-popup">
-    <div class="tools-popup-header">Tools</div>
-    <div class="tools-grid">
-      <div class="tool-item" data-tool="terminal">
-        <div class="tool-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="4 17 10 11 4 5" />
-            <line x1="12" y1="19" x2="20" y2="19" />
-          </svg>
+    <!-- ═══ MODAL: List (items / search results) ═══ -->
+    <div class="modal-list hidden" id="modal-list">
+      <button class="response-dismiss" id="list-dismiss" aria-label="Dismiss">
+        <svg width="10" height="10" viewBox="0 0 10 10">
+          <path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+        </svg>
+      </button>
+      <div class="modal-list-title" id="list-title"></div>
+      <div class="modal-list-message" id="list-message"></div>
+      <div class="modal-list-items" id="list-items"></div>
+    </div>
+
+    <!-- ═══ MODAL: Confirm (action buttons) ═══ -->
+    <div class="modal-confirm hidden" id="modal-confirm">
+      <button class="response-dismiss" id="confirm-dismiss" aria-label="Dismiss">
+        <svg width="10" height="10" viewBox="0 0 10 10">
+          <path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+        </svg>
+      </button>
+      <div class="modal-confirm-body" id="confirm-body"></div>
+      <div class="modal-confirm-actions" id="confirm-actions"></div>
+    </div>
+
+    <!-- ═══ MODAL: Media (image viewer) ═══ -->
+    <div class="modal-media hidden" id="modal-media">
+      <button class="response-dismiss" id="media-dismiss" aria-label="Dismiss">
+        <svg width="10" height="10" viewBox="0 0 10 10">
+          <path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+        </svg>
+      </button>
+      <div class="modal-media-message" id="media-message"></div>
+      <img class="modal-media-img" id="media-img" alt="" />
+      <div class="modal-media-caption" id="media-caption"></div>
+    </div>
+
+    <!-- ═══ MODAL: Steps (progress timeline / plan preview) ═══ -->
+    <div class="modal-steps hidden" id="modal-steps">
+      <button class="response-dismiss" id="steps-dismiss" aria-label="Dismiss">
+        <svg width="10" height="10" viewBox="0 0 10 10">
+          <path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+        </svg>
+      </button>
+      <div class="modal-steps-title" id="steps-title"></div>
+      <div class="modal-steps-subtitle" id="steps-subtitle"></div>
+      <div class="modal-steps-message" id="steps-message"></div>
+      <div class="modal-steps-timeline" id="steps-timeline"></div>
+      <div class="modal-steps-actions hidden" id="steps-actions"></div>
+    </div>
+
+    <!-- ═══ MODAL: Cards (image + text cards) ═══ -->
+    <div class="modal-products hidden" id="modal-products">
+      <button class="response-dismiss" id="products-dismiss" aria-label="Dismiss">
+        <svg width="10" height="10" viewBox="0 0 10 10">
+          <path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+        </svg>
+      </button>
+      <div class="modal-products-header" id="products-header">
+        <div class="modal-products-header-text">
+          <div class="modal-products-title" id="products-title"></div>
+          <div class="modal-products-subtitle" id="products-subtitle"></div>
         </div>
-        <span>Terminal</span>
       </div>
-      <div class="tool-item" data-tool="browser">
-        <div class="tool-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <circle cx="12" cy="12" r="10" />
-            <line x1="2" y1="12" x2="22" y2="12" />
-            <path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z" />
-          </svg>
-        </div>
-        <span>Browser</span>
+      <div class="modal-products-message" id="products-message"></div>
+      <div class="modal-products-body" id="products-body">
+        <div class="modal-products-grid" id="products-grid"></div>
+        <div class="modal-products-sidebar hidden" id="products-sidebar"></div>
       </div>
-      <div class="tool-item" data-tool="files">
-        <div class="tool-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
-          </svg>
-        </div>
-        <span>Files</span>
+    </div>
+
+    <!-- ═══ Command Panel (shortcut-driven text prompting) ═══ -->
+    <div class="command-panel hidden" id="command-panel">
+      <div class="command-panel-header">
+        <div class="command-panel-title">Moonwalk Agent</div>
+        <button class="command-panel-close" id="command-panel-close" aria-label="Close">Close</button>
       </div>
-      <div class="tool-item" data-tool="python">
-        <div class="tool-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10 10-4.5 10-10S17.5 2 12 2z" />
-            <path d="M8 12l2 2 4-4" />
-          </svg>
-        </div>
-        <span>Python</span>
+      <div class="command-panel-subtitle">Type a request and run it directly.</div>
+      <div class="command-panel-capabilities">
+        Browser tasks, file edits, shell commands, app actions, Google Workspace, and multi-step agent execution.
       </div>
-      <div class="tool-item" data-tool="email">
-        <div class="tool-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z" />
-            <polyline points="22,6 12,13 2,6" />
-          </svg>
-        </div>
-        <span>Email</span>
-      </div>
-      <div class="tool-item" data-tool="search">
-        <div class="tool-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <circle cx="11" cy="11" r="8" />
-            <line x1="21" y1="21" x2="16.65" y2="16.65" />
-          </svg>
-        </div>
-        <span>Search</span>
+      <textarea
+        id="command-input"
+        class="command-input"
+        placeholder="Example: research UK housing systems and create a Google document with findings"></textarea>
+      <div class="command-panel-footer">
+        <span class="command-panel-hint">Enter to send. Shift+Enter for newline.</span>
+        <button class="command-panel-send" id="command-panel-send">Run</button>
       </div>
     </div>
   </div>
 
-  <!-- ═══ BOTTOM AGENT DRAWER ═══ -->
-  <div class="agent-drawer hidden" id="agent-drawer">
-    <div class="drawer-handle" id="drawer-handle">
-      <div class="drawer-handle-bar"></div>
-    </div>
-    <div class="drawer-header">
-      <span class="drawer-title">Agent Threads</span>
-      <span class="drawer-count" id="drawer-count">0 agents</span>
-    </div>
-    <div class="drawer-threads" id="drawer-threads">
-      <!-- Agent thread cards will be injected here -->
-      <div class="drawer-empty" id="drawer-empty">No agents running. Ask Moonwalk to spawn one!</div>
-    </div>
-  </div>
-
-  <input id="key-capture" class="key-capture" type="text" />
+  <script src="../node_modules/katex/dist/katex.min.js"></script>
   <script src="./renderer.js"></script>
 </body>
 
